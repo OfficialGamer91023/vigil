@@ -12,7 +12,7 @@ Two bugs this module is built to avoid, both from §4.3.1:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from vigil.config import RegimeConfig, regime_config
@@ -39,6 +39,10 @@ class MarketSnapshot:
     # documented cold-start path rather than a silent guess.
     vrp_history: list[float]
     iv_history: list[float]
+    # Trailing realized vol, from `scripts/backfill_vrp.py`. Backfillable where
+    # `vrp_history` is not, which is what makes the cold-start path usable —
+    # see `_cold_start_vrp_pct`.
+    rv_history: list[float] = field(default_factory=list)
 
     @property
     def vrp_raw(self) -> float:
@@ -60,6 +64,42 @@ class RegimeVerdict:
     iv_pct: float | None = None
 
 
+def _cold_start_vrp_pct(snap: MarketSnapshot) -> float:
+    """Stand in for the VRP percentile before 60 sessions of `vrp_raw` exist.
+
+    **Why a stand-in is needed at all.** `vrp_raw = iv_atm − rv_annual`, and the
+    free tier serves no historical implied volatility, so the true series can only
+    accumulate forward one session at a time. On day one there is nothing to rank
+    against.
+
+    **Why not §4.3.1's documented fallback.** That fallback is the absolute test
+    `vrp_raw > 0` — and §4.3.1 spends a page explaining that short-dated IV sits
+    above trailing RV on nearly every session, so the test is true almost always,
+    **STRESS never fires, and the router collapses to "always sell."** Using it
+    means starting the competition with the safety regime disabled.
+
+    **The proxy.** Realized vol *is* backfillable, and it is the moving half of
+    the subtraction: with IV roughly stable session to session, `vrp_raw` falls
+    precisely when `rv_annual` rises. So rank today's realized vol within its own
+    trailing distribution and invert it — a session whose RV is in the top decile
+    lands at a VRP percentile in the bottom decile, and STRESS fires.
+
+    Read plainly, that says *"the market is moving unusually fast today, so do not
+    sell premium into it"* — which is what STRESS is for, and arguably a more
+    direct statement of it than the VRP formulation. It is still a proxy, and the
+    verdict is still flagged `cold_start`, because the assumption that IV is
+    stable is exactly the thing that fails on the days this matters most.
+    """
+    if snap.rv_history:
+        rv_pct = percentile_rank(snap.rv_annual, snap.rv_history)
+        if rv_pct is not None:
+            # High realized vol -> low VRP percentile. The inversion is the point.
+            return 1.0 - rv_pct
+    # No backfill either. Fall back to §4.3.1's absolute test, degenerate as it is
+    # — a weak signal that is honestly labelled beats an exception at 09:31.
+    return 1.0 if snap.vrp_raw > 0 else 0.0
+
+
 def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVerdict:
     """Map a market snapshot to a regime and the structure that regime wants."""
     c = cfg or regime_config()
@@ -71,9 +111,7 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
 
     cold_start = vrp_pct is None
     if cold_start:
-        # §4.3.1's documented fallback: until 60 sessions exist, use the absolute
-        # sign test — and record that we did, because it is a weaker statement.
-        vrp_pct = 1.0 if snap.vrp_raw > 0 else 0.0
+        vrp_pct = _cold_start_vrp_pct(snap)
 
     def verdict(
         regime: Regime,

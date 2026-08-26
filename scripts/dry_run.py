@@ -21,6 +21,7 @@ from vigil.data.chain import STOCK_FEED, fetch_chain, fetch_open_interest, spot_
 from vigil.domain import PortfolioState
 from vigil.risk.context import KernelContext
 from vigil.risk.kernel import evaluate
+from vigil.signals.history import rv_history
 from vigil.signals.regime import MarketSnapshot, classify
 from vigil.signals.vol import BARS_PER_SESSION, realized_vol
 from vigil.strategy.candidates import build_for_regime
@@ -108,6 +109,9 @@ def run(underlying: str) -> bool:
         rv_annual=rv or 0.0,
         vrp_history=[],
         iv_history=[],
+        # Backfilled by `make vrp`. Empty until then, which drops the router onto
+        # the degenerate absolute test rather than the realized-vol proxy.
+        rv_history=list(rv_history(underlying)),
     )
 
     chain = fetch_chain(underlying, spot=spot, max_dte=scfg.max_dte, strike_window=Decimal(25))

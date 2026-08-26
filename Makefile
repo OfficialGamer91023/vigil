@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 vrp smoke dry-run clean
+.PHONY: setup lint test measure a1 a2 vrp smoke dry-run flatten cli clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -43,6 +43,19 @@ dry-run:
 # Dry run of the mleg probe. Pass --submit yourself to actually place an order.
 smoke:
 	$(RUN) python scripts/a4_mleg_smoke.py
+
+# --- Ops (PLAN §2.1) --------------------------------------------------------
+# The CLI is a separate tool, not a project dependency: alpaca-cli requires
+# Python >= 3.14 while this project is pinned to 3.12 (docs/CLI_NOTES.md §2).
+cli:
+	uv tool install alpaca-cli
+	alpaca-cli --version
+
+# Emergency flatten. Goes through the script, never the CLI directly — the CLI
+# keeps its own paper/live mode that vigil/settings.py cannot see, and the script
+# is where that gap is closed. See docs/CLI_NOTES.md §2.
+flatten:
+	./scripts/flatten.sh
 
 clean:
 	rm -rf .ruff_cache .mypy_cache .pytest_cache

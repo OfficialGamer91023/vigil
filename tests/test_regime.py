@@ -103,3 +103,44 @@ def test_every_verdict_carries_the_numbers_it_reasoned_from() -> None:
     v = classify(snap())
     assert v.vrp_pct is not None and v.trend is not None
     assert v.reason
+
+
+# --------------------------------------------------------------------------- #
+# Cold start — the safety regime must be reachable on day one
+# --------------------------------------------------------------------------- #
+
+def test_cold_start_ranks_realized_vol_when_the_vrp_series_is_empty() -> None:
+    """§4.3.1's own fallback (`vrp_raw > 0`) is true nearly every session, so
+    STRESS would never fire and the router would collapse to 'always sell'.
+
+    Realized vol is backfillable where historical IV is not, and it is the moving
+    half of `iv − rv`: a session in the top decile of RV lands in the bottom
+    decile of VRP, which is exactly when we want to stand down.
+    """
+    calm = [0.05 + i / 1000 for i in range(60)]   # 0.050 .. 0.109
+    v = classify(snap(vrp_history=[], rv_annual=0.30, rv_history=calm))
+    assert v.cold_start is True
+    assert v.regime is Regime.STRESS, "a violently moving session did not stand down"
+
+
+def test_cold_start_still_sells_premium_on_a_quiet_session() -> None:
+    """The proxy must not simply refuse to trade — a gate that never passes is as
+    broken as one that never fires (§5.2)."""
+    calm = [0.05 + i / 1000 for i in range(60)]
+    v = classify(snap(vrp_history=[], rv_annual=0.051, rv_history=calm))
+    assert v.cold_start is True
+    assert v.regime is not Regime.STRESS
+    assert v.structure is not None
+
+
+def test_cold_start_falls_back_to_the_sign_test_with_no_backfill_at_all() -> None:
+    """Degenerate, and honestly labelled — but better than an exception at 09:31."""
+    v = classify(snap(vrp_history=[], rv_history=[]))
+    assert v.cold_start is True
+    assert v.structure is not None
+
+
+def test_a_warm_vrp_series_ignores_the_realized_vol_proxy() -> None:
+    """Once the real distribution exists it wins; the proxy is cold start only."""
+    v = classify(snap(rv_history=[0.05 + i / 1000 for i in range(60)]))
+    assert v.cold_start is False
