@@ -340,6 +340,112 @@ def build_iron_condor(
     )
 
 
+def build_long_strangle(
+    contracts: Sequence[Contract],
+    *,
+    underlying: str,
+    spot: Decimal,
+    expiry: date,
+    risk_budget: Decimal,
+    remaining_delta_budget: Decimal,
+    open_interest: dict[str, int] | None = None,
+    regime: Regime | None = None,
+    size_multiplier: Decimal = Decimal(1),
+    config: StrategyConfig | None = None,
+) -> TradeProposal | None:
+    """The convexity sleeve (§4.5, §4.7): buy an OTM call **and** an OTM put.
+
+    **Why this rather than the obvious directional debit spread.** Measured on
+    26 Aug 2026: a $1-wide debit spread at 0.35/0.29 delta carries ~$4,590 of
+    dollar delta per contract on a $765 underlying. Gate 7 allows $5,000 across
+    the *whole book*, so a single contract consumes 92% of the portfolio's
+    directional budget and the sleeve deploys **$54 of its $440** — six times
+    smaller than the 5% allocation PLAN §12 explicitly rejected as decoration.
+    The sleeve was killed by Gate 7, not by its budget.
+
+    A strangle fixes it structurally rather than by argument: the long call's
+    positive delta and the long put's negative delta cancel, so Gate 7 stops
+    binding and the sleeve sizes to the risk budget it was actually given. It is
+    also the more honest expression of the thesis — CHEAP-VOL says *volatility is
+    underpriced*, which is a statement about magnitude, not direction. A debit
+    spread additionally requires being right about which way.
+
+    Still defined risk, and trivially so: with no short leg there is nothing to be
+    assigned on, so max loss is the premium paid. Max profit is genuinely
+    unbounded, which is the point — this is the only structure in the book whose
+    payoff is convex.
+    """
+    cfg = config or strategy_config()
+    target = cfg.convexity_strangle_delta
+
+    calls = [c for c in contracts
+             if not c.occ.is_put and c.occ.expiry == expiry and c.occ.strike > spot]
+    puts = [c for c in contracts
+            if c.occ.is_put and c.occ.expiry == expiry and c.occ.strike < spot]
+    if not calls or not puts:
+        return None
+
+    call_c = pick_by_delta(calls, target=target)
+    put_c = pick_by_delta(puts, target=target)
+    if call_c is None or put_c is None:
+        return None
+
+    call_leg, put_leg = _leg(call_c, short=False), _leg(put_c, short=False)
+    if call_leg is None or put_leg is None:
+        return None
+
+    if open_interest:
+        call_leg = _with_oi(call_leg, open_interest)
+        put_leg = _with_oi(put_leg, open_interest)
+
+    # Both legs are bought, so the conservative price pays both asks.
+    net_debit = call_leg.ask + put_leg.ask
+    if net_debit <= 0:
+        return None
+    mid_debit = call_leg.mid + put_leg.mid
+    if mid_debit <= 0:
+        return None
+
+    delta_per_contract = sum(
+        (Decimal(str(leg.delta)) * leg.signed_ratio * CONTRACT_MULTIPLIER * spot
+         for leg in (call_leg, put_leg)),
+        Decimal(0),
+    )
+    n = size_position(
+        # Width is meaningless here and Gate 1 requires it declared as 0; sizing
+        # reads the negative `net_credit` and takes the premium as the max loss.
+        width=Decimal(0),
+        net_credit=-net_debit,
+        risk_budget=risk_budget,
+        delta_per_contract=delta_per_contract,
+        remaining_delta_budget=remaining_delta_budget,
+        size_multiplier=size_multiplier,
+    )
+    if n < 1:
+        return None
+
+    return TradeProposal(
+        structure=Structure.LONG_STRANGLE,
+        underlying=underlying,
+        spot=spot,
+        expiry=expiry,
+        legs=(call_leg, put_leg),
+        contracts=n,
+        net_credit=-net_debit,
+        # Declared 0, not omitted: Gate 1 rejects a long-only structure that
+        # claims a width, because the risk arithmetic would then multiply by it.
+        width=Decimal(0),
+        client_order_id=_client_order_id("strg"),
+        limit_price=mid_debit,
+        regime=regime,
+        rationale=(
+            f"long_strangle {put_leg.occ.strike}P / {call_leg.occ.strike}C x{n}, "
+            f"debit {net_debit}, deltas {put_leg.delta:+.3f}/{call_leg.delta:+.3f} "
+            f"(net {float(delta_per_contract / (CONTRACT_MULTIPLIER * spot)):+.3f})"
+        ),
+    )
+
+
 def build_for_regime(
     verdict: RegimeVerdict,
     contracts: Sequence[Contract],
@@ -392,10 +498,20 @@ def build_for_regime(
             return build_vertical(contracts, is_put=False, risk_budget=risk_budget, **common)  # type: ignore[arg-type]
         case Structure.IRON_CONDOR:
             return build_iron_condor(contracts, risk_budget=risk_budget, **common)  # type: ignore[arg-type]
+        case Structure.LONG_STRANGLE:
+            # The sleeve's default. Delta-neutral, so Gate 7 does not bind and it
+            # can actually be sized to its budget — see `build_long_strangle`.
+            # No trend read is needed: CHEAP-VOL is a claim about magnitude.
+            return build_long_strangle(
+                contracts, risk_budget=risk_budget * cfg.convexity_risk_share, **common  # type: ignore[arg-type]
+            )
         case Structure.DEBIT_SPREAD:
-            # Direction follows the trend read: buy calls into strength, puts into
-            # weakness. With no trend available, a debit spread is a coin flip with
-            # a premium attached, so decline rather than guess.
+            # Kept as a selectable structure rather than routed to by a regime:
+            # Gate 7 caps it near one contract, so it cannot carry the sleeve
+            # (§4.7). It stays in the menu the PM agent may pick from when a
+            # directional convex bet is genuinely wanted at small size.
+            # Direction follows the trend read; with no trend a debit spread is a
+            # coin flip with a premium attached, so decline rather than guess.
             if verdict.trend is None:
                 return None
             sleeve = risk_budget * cfg.convexity_risk_share

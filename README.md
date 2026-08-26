@@ -61,9 +61,16 @@ fixed, each with a regression test:
 | B5 | Gate 11 read wall-clock fields off the caller's timezone | The same instant passed or failed depending on the zone attached; a UTC container would permit pre-market entry |
 | B6 | Open-interest fetch read one page | Truncation looked identical to genuinely illiquid contracts, and Gate 8 rejected for a reason that was not true |
 
-The convexity sleeve ([PLAN §4.7](docs/PLAN.md)) now exists as a real debit-spread builder with its own
-ladder — it is the only convex payoff in the book, and the plan's whole argument against finishing at
-+0.4% rests on it.
+Building the convexity sleeve then surfaced a seventh problem that no unit test could catch, because every
+individual value was inside its own limit — **two correct gates interacting**. A directional debit spread
+carries ~$4,590 of dollar delta per contract, so one contract consumes 92% of Gate 7's entire $5,000
+portfolio budget and the sleeve deployed **$54 of its $440** — six times smaller than the allocation
+[PLAN §12](docs/PLAN.md) rejects by name as decoration. The sleeve was killed by Gate 7, not by its budget.
+
+The sleeve is therefore a **long strangle**: symmetric OTM call and put, deltas cancel, Gate 7 stops
+binding, and it deploys $336 of $440 (76%) at ~$0 dollar delta. It is also the more honest reading of the
+signal — CHEAP-VOL is a claim about magnitude, and a spread additionally requires being right about
+direction. Derivation in [PLAN §4.5.1](docs/PLAN.md) and [PRIMER §3.6](docs/PRIMER.md).
 
 **Still open:** the sign convention of `limit_price` on a net-credit mleg package (A4) is unverified and
 five components now share the assumption; and A3 has been probed at a single point rather than replayed

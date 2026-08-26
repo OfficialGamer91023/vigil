@@ -9,7 +9,8 @@ from vigil.execution.pricing import (
     credit_ladder,
     debit_ladder,
     debit_profit_target_price,
-    max_debit_for_ratio,
+    natural_debit_ceiling,
+    premium_multiple_target_price,
     profit_target_price,
     round_to_tick,
 )
@@ -80,17 +81,50 @@ def test_a_debit_already_at_the_ceiling_gets_a_single_rung() -> None:
     assert lad.rungs == (Decimal("0.52"),)
 
 
-def test_the_debit_ceiling_comes_from_gate_9_rather_than_a_new_knob() -> None:
-    """`D / (W − D) ≤ r` rearranges to `D ≤ rW/(1+r)`. Deriving the ceiling from
-    the gate means the ladder can never concede to a price the kernel would then
-    reject — the same discipline the credit floor already follows."""
+def test_the_debit_ceiling_is_the_natural_price() -> None:
+    """§2.5 concedes *toward the natural*, and for a debit package the natural is
+    what the builder already priced: buy the ask, sell the bid."""
+    assert natural_debit_ceiling(Decimal("-0.54")) == Decimal("0.54")
+    assert natural_debit_ceiling(Decimal("0.54")) == Decimal("0.54")
+
+
+def test_the_natural_ceiling_is_tighter_than_the_old_gate_9_bound() -> None:
+    """The ratio bound `D ≤ rW/(1+r)` was legal but far too loose: on a $1-wide
+    spread it permitted paying $0.85 for a package whose natural price was $0.54
+    — conceding 57% past the ask to chase a fill nobody was refusing."""
     width, ratio = Decimal(1), Decimal("5.5")
-    ceiling = max_debit_for_ratio(width, ratio)
-    assert ceiling == ratio * width / (Decimal(1) + ratio)
-    # At the ceiling the ratio is the limit, not past it. Compared at a
-    # tolerance because Decimal division carries 28 significant digits and the
-    # round-trip lands a few ulps short of exactly 5.5.
-    assert abs(ceiling / (width - ceiling) - ratio) < Decimal("1e-20")
+    old_bound = ratio * width / (Decimal(1) + ratio)
+    natural = natural_debit_ceiling(Decimal("-0.54"))
+    assert natural < old_bound
+    assert old_bound > Decimal("0.84")
+
+
+def test_the_ladder_never_offers_past_the_natural() -> None:
+    lad = debit_ladder(target_debit=Decimal("0.50"),
+                       max_debit=natural_debit_ceiling(Decimal("-0.54")))
+    assert all(r <= Decimal("0.54") for r in lad.rungs)
+    assert lad.rungs[0] == Decimal("0.50")
+
+
+def test_an_unbounded_profit_structure_exits_on_a_premium_multiple() -> None:
+    """"50% of max profit" has no meaning when max profit is infinite. A $1.68
+    strangle at 2.0x rests its sell at $3.36 — a 100% gain on the premium."""
+    assert premium_multiple_target_price(Decimal("-1.68"), Decimal(2)) == Decimal("3.36")
+
+
+def test_the_strangle_target_is_not_the_debit_spread_formula_with_zero_width() -> None:
+    """The accident this guards: with `width = 0` the spread formula returns
+    exactly the premium — an order to sell the position back for what it cost.
+
+    The clamp inside `debit_profit_target_price` stops that being an outright
+    loss, but break-even is not a profit target; it is an exit that guarantees
+    the sleeve can never pay.
+    """
+    premium, half = Decimal("1.68"), Decimal("0.50")
+    wrong = debit_profit_target_price(premium, Decimal(0), half)
+    right = premium_multiple_target_price(premium, Decimal(2))
+    assert wrong == premium, "the spread formula degenerates to break-even"
+    assert right > premium
 
 
 def test_the_debit_profit_target_sits_above_what_was_paid() -> None:

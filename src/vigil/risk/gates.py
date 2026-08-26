@@ -68,6 +68,23 @@ def gate_defined_risk(p: TradeProposal, _s: PortfolioState, _c: RiskConfig,
             return _fail(1, name, f"uncovered short {right} leg "
                                   f"({short_qty} short vs {long_qty} long)")
 
+    # A long-only structure (a strangle, a lone long option) has no width, and
+    # saying otherwise would be a fiction the risk arithmetic then multiplies by.
+    # Its max loss is the premium paid — bounded by the cheque we wrote, with no
+    # short leg to be assigned on — so `width` must be declared 0 and the
+    # strike-distance check below simply does not apply.
+    if p.is_long_only:
+        if p.is_credit:
+            return _fail(1, name, "a long-only structure cannot collect a credit "
+                                  f"(net_credit {p.net_credit})")
+        if p.width != 0:
+            return _fail(1, name, f"long-only structure must declare width 0, got {p.width}")
+        max_loss = p.max_loss
+        if not max_loss.is_finite() or max_loss <= 0:
+            return _fail(1, name, f"max loss not finite/positive: {max_loss}")
+        return _ok(1, name, max_loss=str(max_loss), width="n/a (long only)",
+                   expiry=str(p.expiry))
+
     if p.width <= 0:
         return _fail(1, name, f"width must be positive, got {p.width}")
 

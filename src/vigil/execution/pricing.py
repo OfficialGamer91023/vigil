@@ -110,20 +110,27 @@ def debit_ladder(
     return Ladder(rungs=tuple(dict.fromkeys(out)), floor=ceiling)
 
 
-def max_debit_for_ratio(width: Decimal, max_loss_to_profit_ratio: Decimal) -> Decimal:
-    """The largest debit that still satisfies Gate 9's max-loss:max-profit ratio.
+def natural_debit_ceiling(net_credit: Decimal) -> Decimal:
+    """The most we will ever pay: the **natural** price of the package.
 
-    For a debit spread, max loss is the debit `D` and max profit is `W − D`, so
-    the gate reads `D / (W − D) ≤ r`, which rearranges to `D ≤ r·W / (1 + r)`.
+    §2.5 says to start at the mid and concede *toward the natural*, and for a
+    debit structure the natural is exactly what the builder already computed —
+    buy at the ask, sell at the bid — carried as `abs(net_credit)`. So the
+    ceiling is the price the kernel has already judged and approved. Conceding
+    to it can never produce a fill worse than the economics Gate 2 sized against.
 
-    Deriving the ceiling from the gate — rather than inventing a separate
-    `max_debit_pct_of_width` knob — is the same discipline the credit ladder
-    already follows: the ladder never concedes to a price the kernel would then
-    reject, and there is exactly one place that decides what "too expensive" means.
+    This replaces an earlier ceiling derived from Gate 9's loss:profit ratio
+    (`D ≤ rW/(1+r)`). That bound was *legal* but far too loose — on a $1-wide
+    spread it permitted paying $0.85 for a package whose natural price was
+    $0.54, conceding 57% past the ask to chase a fill nobody was refusing. The
+    gate is a boundary on what is *acceptable*; the natural is a boundary on
+    what is *necessary*, and the tighter of the two is the one to obey.
+
+    It also generalises where the ratio bound could not: a long strangle has no
+    width and unbounded profit, so `rW/(1+r)` is meaningless for it, while the
+    natural price is exactly as well defined as it is for any other package.
     """
-    if width <= 0 or max_loss_to_profit_ratio <= 0:
-        return Decimal(0)
-    return max_loss_to_profit_ratio * width / (Decimal(1) + max_loss_to_profit_ratio)
+    return abs(net_credit)
 
 
 def profit_target_price(net_credit: Decimal, target_pct: Decimal) -> Decimal:
@@ -153,4 +160,22 @@ def debit_profit_target_price(
         net_debit = abs(net_debit)
     profit = max(width - net_debit, Decimal(0))
     price = round_to_tick(net_debit + profit * target_pct, favour_us=False)
+    return max(price, TICK)
+
+
+def premium_multiple_target_price(net_debit: Decimal, multiple: Decimal) -> Decimal:
+    """The exit price for a structure whose max profit is **unbounded**.
+
+    "Close at 50% of max profit" is undefined when max profit is infinite, so a
+    long strangle needs a different rule: exit at a multiple of the premium paid.
+    At `2.0`, a $1.68 strangle rests a sell order at $3.36 — a 100% gain on the
+    cheque written.
+
+    Feeding this case through `debit_profit_target_price` with `width = 0` gives
+    `D + t·max(0 − D, 0)` = **exactly D**: a resting order to sell the position
+    back for precisely what it cost. The negative-profit clamp stops that being
+    an outright loss, but break-even is not a profit target — it is an order that
+    guarantees the sleeve can never pay. That is the accident this prevents.
+    """
+    price = round_to_tick(abs(net_debit) * multiple, favour_us=False)
     return max(price, TICK)

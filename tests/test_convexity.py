@@ -23,7 +23,11 @@ import pytest
 
 from vigil.domain import Regime, Structure
 from vigil.signals.regime import RegimeVerdict
-from vigil.strategy.candidates import build_debit_spread, build_for_regime
+from vigil.strategy.candidates import (
+    build_debit_spread,
+    build_for_regime,
+    build_long_strangle,
+)
 
 EXPIRY = date(2026, 8, 28)
 SPOT = Decimal("765.00")
@@ -237,3 +241,109 @@ def test_the_dispatch_covers_every_member_of_the_structure_enum() -> None:
     src = inspect.getsource(candidates.build_for_regime)
     missing = [s.name for s in Structure if f"Structure.{s.name}" not in src]
     assert not missing, f"build_for_regime has no branch for: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# The long strangle — the sleeve that Gate 7 does not crush
+# --------------------------------------------------------------------------- #
+
+def test_the_strangle_is_delta_neutral_enough_that_gate_7_stops_binding(chain) -> None:
+    """**The whole reason this structure exists.** A directional debit spread
+    carries ~$4,590 of dollar delta per contract against Gate 7's $5,000 budget
+    for the entire book, so one contract consumes 92% of it."""
+    strangle = build_long_strangle(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    spread = build_debit_spread(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY, is_put=False,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert strangle is not None and spread is not None
+
+    per_contract = abs(strangle.dollar_delta) / strangle.contracts
+    assert per_contract < abs(spread.dollar_delta) / spread.contracts / 10
+
+
+def test_the_strangle_buys_both_sides(chain) -> None:
+    p = build_long_strangle(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+    assert p.structure is Structure.LONG_STRANGLE
+    assert {leg.occ.is_put for leg in p.legs} == {True, False}
+    assert all(not leg.is_short for leg in p.legs), "a strangle has no short leg"
+    assert p.is_long_only
+
+
+def test_both_strangle_legs_are_out_of_the_money(chain) -> None:
+    """An ITM leg is intrinsic value, not convexity — it costs far more and buys
+    less movement per dollar."""
+    p = build_long_strangle(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+    call = next(leg for leg in p.legs if not leg.occ.is_put)
+    put = next(leg for leg in p.legs if leg.occ.is_put)
+    assert call.occ.strike > SPOT
+    assert put.occ.strike < SPOT
+
+
+def test_max_loss_is_the_premium_and_max_profit_is_unbounded(chain) -> None:
+    """With no short leg there is nothing to be assigned on, so the cheque we
+    wrote is the whole exposure — and nothing caps the upside."""
+    p = build_long_strangle(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+    assert p.max_loss_per_contract == abs(p.net_credit) * 100
+    assert p.max_profit_per_contract == Decimal("Infinity")
+    assert p.max_loss.is_finite(), "Gate 1 requires a finite, computable max loss"
+
+
+def test_the_strangle_declares_no_width(chain) -> None:
+    """Width is meaningless across a call and a put — the distance between the
+    strikes is the range the underlying must escape, not the edge of a payoff."""
+    p = build_long_strangle(
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None and p.width == 0
+
+
+def test_cheap_vol_now_routes_to_the_strangle(chain) -> None:
+    p = build_for_regime(
+        _verdict(Regime.CHEAP_VOL, Structure.LONG_STRANGLE, trend=0.004),
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+    assert p.structure is Structure.LONG_STRANGLE
+    assert not p.is_credit
+
+
+def test_the_strangle_needs_no_trend_read(chain) -> None:
+    """Unlike the debit spread: CHEAP-VOL is a claim about magnitude, so a
+    trendless session is not a reason to decline."""
+    p = build_for_regime(
+        _verdict(Regime.CHEAP_VOL, Structure.LONG_STRANGLE, trend=None),
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+
+
+def test_the_sleeve_now_deploys_a_real_share_of_its_budget(chain) -> None:
+    """The regression that motivated the whole structure change.
+
+    The debit-spread sleeve deployed $54 of $440 — 12%, and six times smaller
+    than the 5% allocation PLAN §12 rejected as decoration. A hedge that cannot
+    pay is not a hedge.
+    """
+    from vigil.config import strategy_config
+
+    sleeve = BUDGET * strategy_config().convexity_risk_share
+    p = build_for_regime(
+        _verdict(Regime.CHEAP_VOL, Structure.LONG_STRANGLE, trend=0.004),
+        chain, underlying="SPY", spot=SPOT, expiry=EXPIRY,
+        risk_budget=BUDGET, remaining_delta_budget=DELTA_BUDGET, open_interest=_oi(chain))
+    assert p is not None
+    assert p.max_loss <= sleeve, "the sleeve must still respect its own budget"
+    assert p.max_loss / sleeve > Decimal("0.5"), (
+        f"sleeve deployed only {p.max_loss / sleeve:.0%} of ${sleeve} — decoration again"
+    )

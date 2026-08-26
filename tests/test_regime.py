@@ -72,7 +72,9 @@ def test_the_sign_test_would_have_missed_that_entirely() -> None:
 def test_cheap_iv_funds_the_convexity_sleeve() -> None:
     v = classify(snap(iv_atm=0.05, rv_annual=0.02, iv_history=[0.10 + i / 100 for i in range(60)]))
     assert v.regime is Regime.CHEAP_VOL
-    assert v.structure is Structure.DEBIT_SPREAD
+    # A long strangle, not a debit spread: "vol is cheap" is a claim about
+    # magnitude, and Gate 7 caps a directional structure at ~1 contract anyway.
+    assert v.structure is Structure.LONG_STRANGLE
 
 
 def test_cold_start_is_flagged_not_hidden() -> None:

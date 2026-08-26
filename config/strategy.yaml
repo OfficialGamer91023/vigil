@@ -39,6 +39,18 @@ convexity_max_dte: 7
 # structure cheap while leaving a realistic path to max profit at 2-7 DTE.
 convexity_long_delta_target: 0.35
 
+# The sleeve's DEFAULT structure is a long strangle, not the debit spread above.
+# Measured 26 Aug 2026: a directional debit spread carries ~$4,590 of dollar delta
+# per contract, so ONE contract consumes 92% of Gate 7's entire $5,000 budget and
+# the sleeve deploys $54 of its $440 - six times smaller than the 5% allocation
+# PLAN §12 rejected as decoration. A strangle's call and put deltas cancel, so
+# Gate 7 stops binding and the sleeve can actually be sized to its budget.
+convexity_strangle_delta: 0.16
+
+# Max profit on a strangle is unbounded, so "50% of max profit" is undefined.
+# Exit at a multiple of the premium paid instead: 2.0 = close on a 100% gain.
+convexity_profit_target_multiple: 2.0
+
 # --- Regime router (§4.3) ---------------------------------------------------
 regime:
   # Trend is EMA(fast) vs EMA(slow) on daily closes, expressed as a fraction of

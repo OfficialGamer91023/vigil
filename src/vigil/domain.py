@@ -27,6 +27,7 @@ class Structure(StrEnum):
     CALL_CREDIT_SPREAD = "call_credit_spread"
     IRON_CONDOR = "iron_condor"
     DEBIT_SPREAD = "debit_spread"
+    LONG_STRANGLE = "long_strangle"
 
 
 class Regime(StrEnum):
@@ -111,10 +112,24 @@ class TradeProposal:
         return self.net_credit > 0
 
     @property
-    def max_loss_per_contract(self) -> Decimal:
-        """Width minus credit for a vertical; the debit paid for a debit spread.
+    def is_long_only(self) -> bool:
+        """No short legs anywhere — a purely long-premium structure.
 
-        Both are finite by construction — which is Gate 1's whole subject.
+        Derived from the legs rather than from `structure`, so it stays true for
+        any long-only shape someone adds later without needing a new branch. It
+        is the property that decides whether `width` means anything: a long
+        strangle's call and put strikes are not the edges of a spread, so the
+        distance between them describes nothing about the payoff.
+        """
+        return bool(self.legs) and all(not leg.is_short for leg in self.legs)
+
+    @property
+    def max_loss_per_contract(self) -> Decimal:
+        """Width minus credit for a vertical; the premium paid for anything long.
+
+        Finite in every branch — which is Gate 1's whole subject. Note that the
+        long-only case needs no special handling: with no short leg there is
+        nothing to be assigned on, so the premium paid *is* the whole exposure.
         """
         if self.is_credit:
             return (self.width - self.net_credit) * CONTRACT_MULTIPLIER
@@ -122,8 +137,23 @@ class TradeProposal:
 
     @property
     def max_profit_per_contract(self) -> Decimal:
+        """Capped for spreads; **unbounded** for a long-only structure.
+
+        A long strangle has no short leg to cap the upside, so the honest answer
+        is infinity rather than a large number that would look measured. Two
+        consequences worth knowing:
+
+        - Gate 9's `max_loss / max_profit` ratio evaluates to 0 and passes, which
+          is correct: that gate exists to refuse risking a lot to make a little,
+          and this structure is the opposite shape.
+        - **The journal must store NULL here, not a number.** Postgres `NUMERIC`
+          cannot hold an infinity, so the repository layer has to map it — a
+          capped stand-in would be a fabricated measurement.
+        """
         if self.is_credit:
             return self.net_credit * CONTRACT_MULTIPLIER
+        if self.is_long_only:
+            return Decimal("Infinity")
         return (self.width - abs(self.net_credit)) * CONTRACT_MULTIPLIER
 
     @property

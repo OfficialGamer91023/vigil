@@ -106,10 +106,14 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
             f"relative to recent pricing; far-OTM condor at reduced size only",
             size_multiplier=Decimal("0.5"))
 
-    # CHEAP-VOL funds the convexity sleeve rather than selling into it.
+    # CHEAP-VOL funds the convexity sleeve rather than selling into it. The
+    # structure is a long strangle, not a directional debit spread: "vol is
+    # cheap" is a claim about *magnitude*, and a spread would additionally
+    # require being right about direction — which Gate 7 then caps at roughly one
+    # contract anyway (see strategy.candidates.build_long_strangle).
     if iv_pct is not None and Decimal(str(iv_pct)) <= c.cheap_vol_iv_pct:
         return verdict(
-            Regime.CHEAP_VOL, Structure.DEBIT_SPREAD,
+            Regime.CHEAP_VOL, Structure.LONG_STRANGLE,
             f"IV percentile {iv_pct:.0%} in the bottom third — buy movement while "
             f"it is on sale")
 

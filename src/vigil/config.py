@@ -112,6 +112,8 @@ class StrategyConfig:
     convexity_min_dte: int
     convexity_max_dte: int
     convexity_long_delta_target: Decimal
+    convexity_strangle_delta: Decimal
+    convexity_profit_target_multiple: Decimal
 
     def width_for(self, underlying: str) -> Decimal:
         """§4.4.3: the narrowest tradeable width, per underlying."""
@@ -135,6 +137,8 @@ class StrategyConfig:
             convexity_min_dte=int(s["convexity_min_dte"]),
             convexity_max_dte=int(s["convexity_max_dte"]),
             convexity_long_delta_target=_dec(s, "convexity_long_delta_target"),
+            convexity_strangle_delta=_dec(s, "convexity_strangle_delta"),
+            convexity_profit_target_multiple=_dec(s, "convexity_profit_target_multiple"),
         )
 
 

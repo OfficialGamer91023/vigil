@@ -32,7 +32,8 @@ from vigil.execution.pricing import (
     credit_ladder,
     debit_ladder,
     debit_profit_target_price,
-    max_debit_for_ratio,
+    natural_debit_ceiling,
+    premium_multiple_target_price,
     profit_target_price,
 )
 from vigil.risk.context import KernelContext
@@ -128,11 +129,9 @@ def submit_entry(
         raise RiskKernelRejection(decision)
 
     # ---- the ladder (§2.5) ------------------------------------------------- #
-    # §2.5: start at the mid (`limit_price`), concede toward the natural. The hard
-    # boundary is Gate 9's own threshold expressed in dollars — conceding past it
-    # would submit a package the kernel would now reject, so the ladder simply
-    # runs out instead. Credit and debit structures concede in opposite
-    # directions, which is why the ladder is chosen rather than assumed.
+    # §2.5: start at the mid (`limit_price`), concede toward the natural. Credit
+    # and debit structures concede in opposite directions and stop at different
+    # kinds of boundary, which is why the ladder is chosen rather than assumed.
     ladder: Ladder = _ladder_for(proposal, rcfg)
 
     entry: Order | None = None
@@ -194,14 +193,14 @@ def _ladder_for(proposal: TradeProposal, rcfg: RiskConfig) -> Ladder:
 
     A credit structure concedes by asking for *less*, bounded below by Gate 9's
     credit floor. A debit structure concedes by offering *more*, bounded above by
-    the largest debit Gate 9's loss:profit ratio still permits. Running a credit
-    ladder against a debit spread would bid progressively less for something we
-    are trying to buy, which simply never fills.
+    the package's natural price. Running a credit ladder against a debit spread
+    would bid progressively less for something we are trying to buy, which simply
+    never fills.
     """
     if proposal.is_credit:
         floor = rcfg.min_credit_pct_of_width * proposal.width
         return credit_ladder(target_credit=proposal.limit_price, min_credit=floor)
-    ceiling = max_debit_for_ratio(proposal.width, rcfg.max_loss_to_profit_ratio)
+    ceiling = natural_debit_ceiling(proposal.net_credit)
     return debit_ladder(target_debit=abs(proposal.limit_price), max_debit=ceiling)
 
 
@@ -233,6 +232,13 @@ def _rest_profit_target(
     )
     if proposal.is_credit:
         target = profit_target_price(filled_price, strategy.profit_target_pct)
+    elif proposal.is_long_only:
+        # Max profit is unbounded, so "50% of max profit" has no meaning. Exit at
+        # a multiple of the premium instead. Routing this through the debit-spread
+        # formula with width 0 would rest a sell order at *half* the premium.
+        target = premium_multiple_target_price(
+            filled_price, strategy.convexity_profit_target_multiple
+        )
     else:
         # A debit structure exits *above* what it paid — see
         # `debit_profit_target_price`. Using the credit formula here would rest an
