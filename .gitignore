@@ -1,0 +1,23 @@
+# Secrets — hard rule #2. This entry exists before .env ever does.
+.env
+.env.*
+!.env.example
+config/account.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Measurement output (Day -1 artefacts, regenerated on demand)
+data/raw/
+*.local.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

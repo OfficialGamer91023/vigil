@@ -1,0 +1,13 @@
+# Tradeable underlyings. Chosen for tight spreads, deep OI, near-daily expiries,
+# and — critically — usable *stock* data on the IEX free tier (§4.2).
+
+primary:   [SPY, QQQ]
+secondary: [IWM, DIA]
+
+# Megacaps are allowed only when no earnings falls inside the contract's life
+# (Gate 10 enforces this; the list alone does not).
+megacaps:  [AAPL, NVDA, MSFT, AMZN, META]
+
+# Index options are tradeable in paper but Alpaca serves NO index options market
+# data. An agent cannot trade what it cannot quote (§1.1).
+excluded:  [SPX, SPXW, XSP, VIX, DJX]

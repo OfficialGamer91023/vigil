@@ -1,0 +1,61 @@
+[project]
+name = "vigil"
+version = "0.1.0"
+description = "Autonomous defined-risk options trading agent (Alpaca paper)"
+readme = "README.md"
+# Pinned to 3.12 per CLAUDE.md. uv will download this interpreter itself if the
+# system Python differs — that is why we can pin narrowly without breaking anyone.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # The hot path into Alpaca: trading, market data, and options chain snapshots.
+    "alpaca-py>=0.33",
+    # LLM portfolio manager (Responses API): strict structured outputs give the
+    # risk kernel a schema-enforced input contract at the API boundary.
+    "openai>=3.3.1",
+    # Reads .env into os.environ. Keys never live in source (hard rule #2).
+    "python-dotenv>=1.0",
+    # config/*.yaml is the only place thresholds live; no magic numbers in code.
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+# uv's native dev-dependency mechanism (PEP 735). Not installed in the runtime image.
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+    # Gate 2's property test: no approved proposal ever exceeds 2% of equity,
+    # proven across generated inputs rather than three hand-picked examples.
+    # A test-only dependency, so it does not belong in the runtime image.
+    "hypothesis>=6.165.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# src/ layout: the importable package is src/vigil, exposed as `vigil`.
+packages = ["src/vigil"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# Third-party stubs are incomplete for alpaca-py; don't fail the build on their types.
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# src layout without relying on the editable install. On macOS, uv marks .venv
+# hidden and CPython silently ignores hidden .pth files, so the editable install
+# can vanish at any time; putting src on the path here makes tests deterministic.
+# "." as well so tests can import shared helpers from tests.conftest.
+pythonpath = ["src", "."]
+testpaths = ["tests"]

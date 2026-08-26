@@ -1,0 +1,56 @@
+# Risk kernel thresholds. PLAN §5. Gate *logic* freezes after Day 4; these numbers
+# stay tunable. Every value here is derived in PLAN §4.4 / §4.7 — read before editing.
+
+# Gate 2 — per-trade risk. 2%, not 1%: six sessions of paper money with truncated
+# downside and rank-based scoring is a tournament, not a career (§4.7).
+max_risk_per_trade_pct: 0.02
+
+# Gate 3 — daily loss stop. Halts new entries; management keeps running.
+daily_loss_halt_pct: -0.03
+
+# Gate 4 — total drawdown from peak equity. Full halt + flatten, human to resume.
+max_drawdown_pct: -0.08
+
+# Gate 5 — concurrent open structures.
+max_open_structures: 6
+
+# Gate 6 — concentration.
+max_structures_per_underlying: 2
+max_risk_share_per_underlying: 0.40
+
+# Gate 7 — portfolio dollar delta: |Σ delta × 100 × spot × qty| ≤ this × equity.
+# Stated in dollars because a bare delta count is unit-ambiguous (§5.1).
+max_dollar_delta_pct: 0.05
+
+# Gate 8 — per-leg liquidity. An untradeable fill is fake P&L.
+min_open_interest: 100
+max_spread_pct_of_mid: 0.10
+# Escape hatch for cheap legs, where a $0.05/$0.10 market is 66% of mid but is
+# still the tightest the chain offers.
+max_spread_abs_cheap_leg: 0.10
+cheap_leg_mid_threshold: 0.30
+
+# Gate 9 — credit quality. 18%, not the "classic" 25%: 25% at 0.16 delta is a
+# 30-45 DTE number and rejects every 0-2 DTE candidate (§4.4.2).
+# MEASURED 26 Aug 2026 (after-hours, stale quotes): $1-wide SPY/QQQ verticals at
+# 0.16 delta priced 11.0-16.5% of width — i.e. BELOW this floor. Re-measure during
+# a live session before trusting either the floor or the delta target.
+min_credit_pct_of_width: 0.18
+max_loss_to_profit_ratio: 5.5
+
+# Gate 10 — event blackout, in minutes around a scheduled macro print.
+# ASYMMETRIC on purpose: before the print the risk is that our quote is about to be
+# repriced, which a few minutes covers. After it the tape is genuinely disorderly —
+# spreads widen, the indicative feed lags hardest, and the move keeps developing.
+macro_blackout_before_minutes: 5
+macro_blackout_after_minutes: 15
+
+# Gate 11 — time windows, US/Eastern. Gate 11 converts to ET before reading any
+# wall-clock field, so a UTC-aware timestamp from a container is handled correctly.
+no_entry_first_minutes: 15
+no_entry_last_minutes: 20
+zero_dte_entry_cutoff: "14:30"
+hard_flatten: "15:40"
+
+# Gate 12 — sanity.
+max_limit_deviation_from_mid: 0.20

@@ -1,0 +1,63 @@
+# Strategy parameters. PLAN §4.5. Justify any change in docs/PRIMER.md Part 4.
+
+# Short strike delta band. The plan keeps delta and moves the credit floor (§4.4.2),
+# so this is the parameter the whole win-rate thesis rests on.
+short_delta_target: 0.16
+short_delta_min: 0.15
+short_delta_max: 0.20
+
+# Days to expiry. 0DTE only after 10:30 and never entered after 14:30 (Gate 11).
+min_dte: 0
+max_dte: 2
+
+# §4.4.3: width is FIXED at the narrowest tradeable; contract count is the free
+# variable. credit/width rises as width narrows, so the narrowest width always
+# collects more premium per dollar of defined risk.
+# CONFIRMED by measurement 26 Aug 2026: $1 -> 14.5%, $2 -> 11.5%, $5 -> 8.9%.
+width_by_underlying:
+  SPY: 1
+  QQQ: 1
+  IWM: 1
+  DIA: 1
+default_width: 1
+
+# Exit policy (§4.4.1). There is deliberately NO mark-based stop: a 2x credit stop
+# is EV-negative at 0-2 DTE and bounded nothing that Gate 2 had not already bounded.
+profit_target_pct: 0.50          # resting GTC order, live at the broker (§2.6)
+breach_exit_min_minutes_left: 30 # short-strike breach is thesis invalidation
+time_stop: "15:40"
+
+# Convexity sleeve (§4.5). Load-bearing at 20-25%, not decoration at 5%.
+# This is the only convex payoff in the book, and §4.7 argues convexity is what a
+# six-session tournament actually pays for.
+convexity_risk_share: 0.22
+convexity_min_dte: 2
+convexity_max_dte: 7
+# Long leg of the debit spread. Nearer the money than the 0.16 we SELL: a debit
+# spread only pays if the underlying actually travels, so buying a 0.16-delta long
+# is buying a lottery ticket that expires before it prints. 0.35 keeps the
+# structure cheap while leaving a realistic path to max profit at 2-7 DTE.
+convexity_long_delta_target: 0.35
+
+# --- Regime router (§4.3) ---------------------------------------------------
+regime:
+  # Trend is EMA(fast) vs EMA(slow) on daily closes, expressed as a fraction of
+  # the slow EMA so it is comparable across underlyings at different price levels.
+  ema_fast: 9
+  ema_slow: 21
+  # Below this separation the tape is not trending — it is chopping, and a
+  # direction-agnostic condor is the right structure.
+  trend_threshold: 0.0015
+
+  # VRP is a rolling PERCENTILE, never `IV - RV > 0` (§4.3.1). The sign test is
+  # true nearly every day, which would make STRESS unreachable and collapse the
+  # router to "always sell".
+  vrp_sell_floor_pct: 0.40      # below this, do not sell premium
+  vrp_stress_pct: 0.10          # bottom decile: vol is cheap relative to recent pricing
+
+  # An overnight gap this large means the model's assumptions were made in a
+  # different market than the one that opened.
+  stress_gap_pct: 0.012
+
+  # CHEAP-VOL funds the convexity sleeve: buy movement when it is on sale.
+  cheap_vol_iv_pct: 0.33
