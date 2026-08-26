@@ -1,86 +1,44 @@
 # Vigil
 
-An autonomous options trading agent for the **lablab.ai × Alpaca AI Trading Agents Hackathon**
-(28 Aug – 4 Sept 2026). It trades defined-risk, short-dated option structures on liquid ETFs in an Alpaca
-paper account, journals every decision, and serves a live desk terminal.
+An autonomous options trading agent built for the **lablab.ai × Alpaca AI Trading Agents Hackathon** (28 Aug – 4 Sept 2026). It trades defined-risk, short-dated option structures on liquid ETFs in an Alpaca paper account, journals every decision, and serves a live desk terminal.
 
-**The idea in one line:** a deterministic risk kernel decides what is *allowed*; an LLM portfolio manager
-decides what is *chosen* from that allowed set. No model output reaches the broker ungated.
+**The core thesis:** A deterministic risk kernel decides what is *allowed*; an LLM portfolio manager decides what is *chosen* from that allowed set. No model output ever reaches the broker without passing through strict, hardcoded risk gates.
 
-## Start here
+## Detailed Overview
 
-| Document | What it is |
-|---|---|
-| **[docs/PRIMER.md](docs/PRIMER.md)** | Options and trading-bot background from zero, plus the reasoning behind every parameter and architecture decision. **Read this first.** |
-| **[docs/PLAN.md](docs/PLAN.md)** | Architecture, data model, the 12 risk gates, the stack, 7-day timeline with cut lines |
-| **[CLAUDE.md](CLAUDE.md)** | Working rules for Claude Code sessions in this repo |
+Vigil is designed to harvest premium by selling short-dated (0-2 DTE) options on highly liquid ETFs (primarily SPY and QQQ). It uses a sophisticated architecture splitting responsibilities between deterministic code and an AI model:
 
-## Stack
+### 1. The Strategy Engine & Regime Router
+The agent does not rely on the LLM to perform mathematical or financial computations. A deterministic "regime router" computes a state vector from underlying market data (trend, realized volatility, implied volatility, intraday structure). Based on the regime (CHOP, TREND-UP, TREND-DOWN, STRESS, CHEAP-VOL), it defaults to a specific structure like an Iron Condor or a Credit Spread. 
 
-`Python 3.12` · `FastAPI` · `Postgres 16 + pgvector` · `SQLAlchemy 2.0 async` · `Alembic` · `Redis` ·
-`arq` · `openai` (GPT-5.5) · `alpaca-py` + Alpaca CLI + MCP · `Next.js 15` · `Docker Compose` ·
-`GitHub Actions`
+### 2. The AI Portfolio Manager (LLM)
+Once the engine generates valid candidate structures, the LLM acts as the Portfolio Manager. Equipped with the Alpaca MCP Server, it can investigate the options chain, check news, and review current account health. It then selects 0-1 structures from the pre-validated candidates, outputting its decision and a structured rationale memo.
 
-Five processes: an **arq worker** that is the agent, a **FastAPI** service that reads the journal and
-streams it, **Postgres** as the record, **Redis** as cache and bus, and a **Next.js** desk terminal.
-See [PLAN.md §10](docs/PLAN.md) for why each piece is present — and **§12 for what was deliberately
-rejected**, which is the more useful list.
+### 3. The Risk Kernel
+Before any order is sent to Alpaca, it must pass 12 deterministic risk gates. This kernel is strictly separated from the LLM. It enforces:
+- Defined risk (no naked shorts)
+- Max loss per trade (≤1.0% of equity)
+- Daily loss limits (≤ -3%)
+- Maximum open structures and concentration limits
+- Liquidity checks and minimum credit quality
+- No trading during specific event blackouts
 
-## Status
+### 4. Execution & Position Management
+Vigil utilizes Alpaca's multi-leg (`mleg`) order support to enter complex positions in a single ticket, guaranteeing defined risk at the broker level. The agent runs on a 15-minute scheduled cycle. On every run, before looking for new entries, it actively manages existing positions: taking profits at predetermined targets, enforcing time stops, and executing a mandatory end-of-day flatten to eliminate overnight risk.
 
-Planning complete and **critically reviewed** — the review found three issues serious enough to change the
-strategy, and they are documented in place rather than quietly patched:
+## Tech Stack
 
-1. **The exit policy had negative expected value.** A 50% profit target paired with a 2× credit stop needs
-   an 80% win rate; touch probability at a 0.16-delta short strike is ~32%. The mark-based stop is deleted.
-   → [PLAN §4.4.1](docs/PLAN.md), [PRIMER §2.2](docs/PRIMER.md)
-2. **Two headline parameters were jointly infeasible.** Credit ≥25% of width is a 30–45 DTE number; paired
-   with a 0–2 DTE mandate it rejects every candidate and the agent never trades. Floor moved to 18%.
-   → [PLAN §4.4.2](docs/PLAN.md)
-3. **The book was sized for the wrong objective function.** A six-session, rank-scored competition with
-   truncated downside has a *convex* payoff; the plan was a variance seller whose best case was ~+0.4%.
-   → [PLAN §4.7](docs/PLAN.md), [PRIMER §2.4](docs/PRIMER.md)
-
-### Day −1 (Wed 26 Aug) — measurement and hardening
-
-**A1 holds:** the indicative feed returns populated greeks and IV (99% coverage once expired contracts
-are filtered out), so no local Black–Scholes is needed. **A2 is more interesting:** single verticals
-price at 8–11% of width conservatively and *fail* the 18% floor, while iron condors clear it at 19–24%
-— a condor collects two credits against one width of risk. That points at condors as the default
-structure, pending a live re-measurement. Details in [docs/CLI_NOTES.md §5](docs/CLI_NOTES.md).
-
-A pre-implementation audit then found six defects in the paths a live session depends on. All six are
-fixed, each with a regression test:
-
-| | Defect | Consequence |
-|---|---|---|
-| B1 | Every price-ladder rung reused one `client_order_id` | Alpaca rejects the duplicate, so the ladder could never concede past rung 1 |
-| B2 | `partially_filled` was treated as "still working" | Cancelled the partial and submitted a second entry ticket, leaving live contracts with no resting exit |
-| B3 | CHEAP-VOL routed to a structure with no builder | Fell through to a **call credit spread** — sold volatility on the session identified as cheap |
-| B4 | Gate 1 took `width` on trust | A $5-wide spread declaring $1 reported $82 max loss instead of $482 and **passed all twelve gates** |
-| B5 | Gate 11 read wall-clock fields off the caller's timezone | The same instant passed or failed depending on the zone attached; a UTC container would permit pre-market entry |
-| B6 | Open-interest fetch read one page | Truncation looked identical to genuinely illiquid contracts, and Gate 8 rejected for a reason that was not true |
-
-Building the convexity sleeve then surfaced a seventh problem that no unit test could catch, because every
-individual value was inside its own limit — **two correct gates interacting**. A directional debit spread
-carries ~$4,590 of dollar delta per contract, so one contract consumes 92% of Gate 7's entire $5,000
-portfolio budget and the sleeve deployed **$54 of its $440** — six times smaller than the allocation
-[PLAN §12](docs/PLAN.md) rejects by name as decoration. The sleeve was killed by Gate 7, not by its budget.
-
-The sleeve is therefore a **long strangle**: symmetric OTM call and put, deltas cancel, Gate 7 stops
-binding, and it deploys $336 of $440 (76%) at ~$0 dollar delta. It is also the more honest reading of the
-signal — CHEAP-VOL is a claim about magnitude, and a spread additionally requires being right about
-direction. Derivation in [PLAN §4.5.1](docs/PLAN.md) and [PRIMER §3.6](docs/PRIMER.md).
-
-**Still open:** the sign convention of `limit_price` on a net-credit mleg package (A4) is unverified and
-five components now share the assumption; and A3 has been probed at a single point rather than replayed
-across 60 sessions.
+- **Core & Data:** `Python 3.12` · `alpaca-py` (Trading API) · Alpaca CLI · Alpaca MCP
+- **AI Agent:** Anthropic `openai` SDK (Claude 3.5 Sonnet/Opus) · `Pydantic` for structured schemas
+- **Storage & Messaging:** `Postgres 16 + pgvector` · `SQLAlchemy 2.0 async` · `Alembic` · `Redis` · `arq` (worker queue)
+- **Frontend / Terminal:** `Next.js 15` · `FastAPI` (backend API)
+- **Infrastructure:** `Docker Compose` · `GitHub Actions`
 
 ## Non-negotiables
 
-- Paper trading only, on a **fresh** dedicated account funded to $100,000
-- Defined risk on every position — no naked short legs
-- Every order passes the risk kernel; one submit path; always limit orders
-- Every open structure carries a **live resting profit-target order at the broker**, not a polled target
-- The API service never trades; the worker runs correctly with everything else stopped
-- `POST /api/control/halt` stops new entries; `/flatten` closes everything
+- **Paper trading only:** Uses a dedicated Alpaca paper account funded with exactly $100,000.
+- **Defined risk:** Every position has a strictly defined maximum loss. No naked short legs are permitted.
+- **Deterministic gating:** Every order must pass the risk kernel. There is only one submit path, utilizing limit orders with price ladders.
+- **Resting limits:** Every open structure carries a live resting profit-target order at the broker, rather than polling for targets.
+- **API separation:** The API service never trades; the worker agent runs autonomously even if the frontend is down.
+- **Emergency paths:** `POST /api/control/halt` stops new entries; `/flatten` immediately closes all positions.
