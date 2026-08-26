@@ -21,3 +21,7 @@ data/raw/
 .DS_Store
 .idea/
 .vscode/
+
+# Ignored for GitHub submission
+CLAUDE.md
+docs/
