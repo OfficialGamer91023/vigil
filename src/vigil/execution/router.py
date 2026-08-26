@@ -24,8 +24,13 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Order
 
 from vigil.config import RiskConfig, StrategyConfig, risk_config, strategy_config
-from vigil.domain import KernelDecision, PortfolioState, TradeProposal
-from vigil.execution.mleg import build_closing_order, build_entry_order
+from vigil.domain import KernelDecision, OpenStructure, PortfolioState, TradeProposal
+from vigil.execution.mleg import (
+    MlegConstructionError,
+    build_close_from_legs,
+    build_closing_order,
+    build_entry_order,
+)
 from vigil.execution.pricing import (
     RUNG_WAIT_SECONDS,
     Ladder,
@@ -252,3 +257,61 @@ def _rest_profit_target(
         contracts=contracts,
     )
     return _as_order(client.submit_order(order))
+
+
+# --------------------------------------------------------------------------- #
+# Closing. Same module (hard rule #4), deliberately NOT kernel-gated.
+# --------------------------------------------------------------------------- #
+
+def submit_close(
+    structure: OpenStructure,
+    limit_price: Decimal,
+    *,
+    client: TradingClient,
+    reason: str,
+    good_till_cancelled: bool = False,
+) -> Order:
+    """Close an open structure. **The kernel does not vote on exits.**
+
+    Hard rule #4 puts every order through this module, and this function honours
+    that. What it deliberately does *not* do is call `evaluate()` first, and the
+    reason is worth stating because the asymmetry looks like an oversight:
+
+    **A gate that can block an exit is not a safety feature, it is a trap.** The
+    twelve gates exist to bound the risk we *take on*. A closing order only ever
+    reduces exposure — and every gate that could plausibly fire here would fire
+    for a reason that is an argument *for* closing, not against it. Gate 3 halts
+    new entries on a bad day; Gate 5 refuses a seventh structure; Gate 11 refuses
+    entries in the last twenty minutes. Route the 15:40 flatten through Gate 11
+    and it would refuse to flatten at 15:40.
+
+    So closes are unconditional, and the safety property is the narrower one:
+    they can only ever be constructed from legs that are already open, in the
+    closing direction, for a quantity we already hold.
+    """
+    if not structure.legs:
+        raise MlegConstructionError(
+            f"cannot close {structure.underlying} {structure.expiry}: no leg symbols "
+            "on the structure. Reconciliation must populate them from the broker."
+        )
+    order = build_close_from_legs(
+        [(leg.symbol, leg.ratio_qty, leg.is_short) for leg in structure.legs],
+        limit_price,
+        contracts=structure.contracts,
+        client_order_id=_close_client_order_id(structure, reason),
+        good_till_cancelled=good_till_cancelled,
+    )
+    return _as_order(client.submit_order(order))
+
+
+def _close_client_order_id(structure: OpenStructure, reason: str) -> str:
+    """A unique, *legible* idempotency key for a close.
+
+    Legible because these are the rows a human reads when asking what the agent
+    did to a position; unique because hard rule #9 makes a duplicate an integrity
+    error, and a sweep that retries after a timeout must not double-close.
+    """
+    import uuid
+
+    tag = reason.split()[0][:12].lower().strip(":,;")
+    return f"vigil-cls-{tag}-{uuid.uuid4().hex[:12]}"

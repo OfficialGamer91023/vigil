@@ -185,8 +185,30 @@ class TradeProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionLeg:
+    """One leg of a position already at the broker.
+
+    Deliberately thinner than `Leg`: closing a structure needs its symbol, its
+    ratio and which way it was opened, and nothing else. Requiring live bids,
+    asks, deltas and open interest to *exit* would mean a position could become
+    unclosable exactly when the feed is worst — which is when exiting matters.
+    """
+
+    symbol: str
+    ratio_qty: int
+    is_short: bool
+
+
+@dataclass(frozen=True, slots=True)
 class OpenStructure:
-    """A position already at the broker, as the kernel needs to see it."""
+    """A position already at the broker, as the kernel and the manage sweep see it.
+
+    The short strikes are split by right rather than kept in one bag, because the
+    only question the manage sweep asks of them is directional: a put spread is
+    breached when spot falls *to or below* its short put, a call spread when spot
+    rises *to or above* its short call. Netting the two into one collection would
+    make that question unanswerable without re-deriving the right from the strike.
+    """
 
     underlying: str
     expiry: date
@@ -194,10 +216,33 @@ class OpenStructure:
     max_loss: Decimal
     dollar_delta: Decimal
     has_resting_target: bool = False
+    structure: Structure | None = None
+    short_put_strikes: tuple[Decimal, ...] = ()
+    short_call_strikes: tuple[Decimal, ...] = ()
+    # Package credit received (positive) or debit paid (negative), per contract.
+    net_credit: Decimal = Decimal(0)
+    contracts: int = 1
+    legs: tuple[PositionLeg, ...] = ()
 
     @property
     def structure_key(self) -> tuple[str, date, tuple[Decimal, ...]]:
         return (self.underlying, self.expiry, tuple(sorted(self.strikes)))
+
+    @property
+    def has_short_legs(self) -> bool:
+        """A long-only structure cannot be breached — there is nothing short to breach."""
+        return bool(self.short_put_strikes or self.short_call_strikes)
+
+    def is_breached(self, spot: Decimal) -> bool:
+        """Has the underlying traded through a short strike?
+
+        Uses the *nearest* short strike on each side — the first one the tape
+        reaches is the one that matters, and on an iron condor the put and call
+        sides are breached independently.
+        """
+        if self.short_put_strikes and spot <= max(self.short_put_strikes):
+            return True
+        return bool(self.short_call_strikes and spot >= min(self.short_call_strikes))
 
 
 @dataclass(frozen=True, slots=True)

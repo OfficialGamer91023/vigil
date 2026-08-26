@@ -11,6 +11,7 @@ direction lives entirely on the legs (docs/CLI_NOTES.md §1).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 
 from alpaca.trading.enums import OrderClass, OrderSide, PositionIntent, TimeInForce
@@ -102,19 +103,49 @@ def build_closing_order(
     we *asked* for would leave an order the account cannot honour.
     """
     qty = proposal.contracts if contracts is None else contracts
-    if qty < 1:
-        raise MlegConstructionError(f"closing order needs >= 1 contract, got {qty}")
+    return build_close_from_legs(
+        [(leg.symbol, leg.ratio_qty, leg.is_short) for leg in proposal.legs],
+        limit_price,
+        contracts=qty,
+        client_order_id=client_order_id,
+        good_till_cancelled=good_till_cancelled,
+    )
+
+
+def build_close_from_legs(
+    legs_spec: Sequence[tuple[str, int, bool]],
+    limit_price: Decimal,
+    *,
+    contracts: int,
+    client_order_id: str,
+    good_till_cancelled: bool = True,
+) -> LimitOrderRequest:
+    """Closing ticket from `(symbol, ratio_qty, is_short)` triples.
+
+    Exists so the **manage sweep** can close a position reconciled from the
+    broker, where no `TradeProposal` survives — after a worker restart, the
+    proposal that opened a structure is a journal row, not an object in memory.
+    Requiring one to exit would make a position unclosable across a restart,
+    which is the opposite of what §2.6's survives-worker-death principle wants.
+    """
+    if not 2 <= len(legs_spec) <= MAX_LEGS:
+        raise MlegConstructionError(
+            f"mleg supports 2-{MAX_LEGS} legs, got {len(legs_spec)}"
+        )
+    if contracts < 1:
+        raise MlegConstructionError(f"closing order needs >= 1 contract, got {contracts}")
+    qty = contracts
     legs = [
         OptionLegRequest(
-            symbol=leg.symbol,
-            ratio_qty=leg.ratio_qty,
+            symbol=symbol,
+            ratio_qty=ratio_qty,
             # Closing reverses the side: what we sold to open, we buy to close.
-            side=OrderSide.BUY if leg.is_short else OrderSide.SELL,
+            side=OrderSide.BUY if is_short else OrderSide.SELL,
             position_intent=(
-                PositionIntent.BUY_TO_CLOSE if leg.is_short else PositionIntent.SELL_TO_CLOSE
+                PositionIntent.BUY_TO_CLOSE if is_short else PositionIntent.SELL_TO_CLOSE
             ),
         )
-        for leg in proposal.legs
+        for symbol, ratio_qty, is_short in legs_spec
     ]
 
     return LimitOrderRequest(

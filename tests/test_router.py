@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import DEFAULT_EXPIRY
 from vigil.execution.router import RiskKernelRejection, submit_entry
 from vigil.risk.context import KernelContext
 
@@ -277,3 +278,84 @@ def test_a_full_fill_is_not_reported_as_partial(put_credit_spread, flat_book, ct
     result = submit_entry(put_credit_spread, flat_book, ctx, client=client, sleep=_noop_sleep)
     assert result.filled and not result.partial
     assert result.filled_contracts == put_credit_spread.contracts
+
+
+# --------------------------------------------------------------------------- #
+# Closing — the kernel does not vote on exits
+# --------------------------------------------------------------------------- #
+
+def _open_spread(target: bool = True):
+    from vigil.domain import OpenStructure, PositionLeg, Structure
+
+    return OpenStructure(
+        underlying="SPY", expiry=DEFAULT_EXPIRY,
+        strikes=(Decimal("761"), Decimal("760")),
+        max_loss=Decimal(80), dollar_delta=Decimal(-3800),
+        has_resting_target=target, structure=Structure.PUT_CREDIT_SPREAD,
+        short_put_strikes=(Decimal("761"),), net_credit=Decimal("0.20"), contracts=4,
+        legs=(PositionLeg("SPY260827P00761000", 1, True),
+              PositionLeg("SPY260827P00760000", 1, False)),
+    )
+
+
+def test_a_close_reverses_every_leg() -> None:
+    from vigil.execution.router import submit_close
+
+    client = FakeTradingClient()
+    submit_close(_open_spread(), Decimal("0.10"), client=client, reason="breach")
+    req = client.submitted[0]
+    assert all("close" in leg.position_intent.value for leg in req.legs)
+    assert req.qty == 4
+
+
+def test_a_close_is_not_blocked_by_a_halted_book() -> None:
+    """**The asymmetry that matters.** A gate that can block an exit is a trap.
+
+    Route the 15:40 flatten through Gate 11 and it would refuse to flatten at
+    15:40; route it through Gate 3 and a bad day would trap the book that made
+    the day bad. Closes are unconditional.
+    """
+    from vigil.execution.router import submit_close
+
+    client = FakeTradingClient()
+    order = submit_close(_open_spread(), Decimal("0.10"), client=client, reason="time_stop")
+    assert order is not None
+    assert len(client.submitted) == 1
+
+
+def test_a_close_defaults_to_day_not_gtc() -> None:
+    """The resting *profit target* is GTC because it must survive worker death.
+    A management close is immediate — leaving it working overnight would reopen
+    tomorrow's session with a stale order against a position already gone."""
+    from vigil.execution.router import submit_close
+
+    client = FakeTradingClient()
+    submit_close(_open_spread(), Decimal("0.10"), client=client, reason="breach")
+    assert client.submitted[0].time_in_force.value == "day"
+
+
+def test_closes_carry_unique_client_order_ids() -> None:
+    """Hard rule #9: a sweep that retries after a timeout must not double-close."""
+    from vigil.execution.router import submit_close
+
+    client = FakeTradingClient()
+    for _ in range(3):
+        submit_close(_open_spread(), Decimal("0.10"), client=client, reason="breach")
+    ids = [r.client_order_id for r in client.submitted]
+    assert len(set(ids)) == 3
+    assert all(i.startswith("vigil-cls-breach-") for i in ids)
+
+
+def test_a_structure_with_no_leg_symbols_refuses_to_close_loudly() -> None:
+    """Reconciliation must populate legs from the broker. Silently skipping a
+    structure we cannot close would leave it unmanaged and unreported."""
+    from dataclasses import replace as dc_replace
+
+    from vigil.execution.mleg import MlegConstructionError
+    from vigil.execution.router import submit_close
+
+    client = FakeTradingClient()
+    with pytest.raises(MlegConstructionError, match="no leg symbols"):
+        submit_close(dc_replace(_open_spread(), legs=()), Decimal("0.10"),
+                     client=client, reason="breach")
+    assert client.submitted == []
