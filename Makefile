@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 vrp smoke dry-run flatten cli clean
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run flatten cli clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -22,7 +22,7 @@ test:
 	$(RUN) pytest -q
 
 # --- Day -1: measure the three load-bearing assumptions (PLAN §1.3) ----------
-measure: a1 a2 vrp
+measure: a1 a2 vrp a3
 
 # A1 — are greeks/IV populated on the indicative feed?
 a1:
@@ -35,6 +35,10 @@ a2:
 # Backfill the 60-session realized-vol series for the regime router
 vrp:
 	$(RUN) python scripts/backfill_vrp.py
+
+# A3 - does the gate stack ever fire? Replays 60 sessions of the regime router.
+a3:
+	$(RUN) python scripts/a3_replay.py
 
 # Full pipeline against a live chain: sense -> regime -> build -> gate. Submits nothing.
 dry-run:
