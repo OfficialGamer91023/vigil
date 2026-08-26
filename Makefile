@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run flatten cli clean
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run flatten cli db migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -47,6 +47,17 @@ dry-run:
 # Dry run of the mleg probe. Pass --submit yourself to actually place an order.
 smoke:
 	$(RUN) python scripts/a4_mleg_smoke.py
+
+# --- Journal (PLAN §3) ------------------------------------------------------
+# Creates the database if it is missing. Migrations never run create_all()
+# against a real database (CLAUDE.md) — the schema only ever moves via Alembic.
+db:
+	@psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='vigil'" | grep -q 1 \
+		|| createdb vigil
+	@echo "database ready: vigil"
+
+migrate: db
+	$(RUN) alembic upgrade head
 
 # --- Ops (PLAN §2.1) --------------------------------------------------------
 # The CLI is a separate tool, not a project dependency: alpaca-cli requires

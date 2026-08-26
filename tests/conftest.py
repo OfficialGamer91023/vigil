@@ -210,3 +210,34 @@ def debit_spread() -> TradeProposal:
         # The mid: 0.61 - 0.22. A positive magnitude, per TradeProposal's contract.
         limit_price=Decimal("0.39"),
     )
+
+
+@pytest.fixture
+def long_strangle() -> TradeProposal:
+    """SPY long strangle — the convexity sleeve (§4.5.1).
+
+    Long-only, so `is_long_only` is True, `max_profit` is `Decimal("Infinity")`
+    and `width` is 0. Gate 1 has a dedicated branch for exactly this shape: a
+    call and a put have no width between them, and claiming one would have the
+    risk arithmetic multiply by a fiction.
+
+    Deltas cancel (+0.16 / −0.16), which is the entire reason the sleeve is a
+    strangle rather than a debit spread — Gate 7 caps a directional structure at
+    roughly one contract.
+    """
+    return TradeProposal(
+        structure=Structure.LONG_STRANGLE,
+        underlying="SPY",
+        spot=Decimal("765.85"),
+        expiry=DEFAULT_EXPIRY,
+        legs=(
+            make_leg("SPY260827C00769000", short=False, bid="0.80", ask="0.84", delta=0.16),
+            make_leg("SPY260827P00761000", short=False, bid="0.80", ask="0.84", delta=-0.16),
+        ),
+        contracts=2,
+        # Conservative: both asks. Negative because the package pays out.
+        net_credit=Decimal("-1.68"),
+        width=Decimal(0),
+        client_order_id="vigil-test-strg-0001",
+        limit_price=Decimal("1.64"),   # both mids
+    )
