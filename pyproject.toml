@@ -27,6 +27,12 @@ dependencies = [
     # JSON-line logs where every line carries session_id and cycle_id: `bind()`
     # attaches cycle context once instead of threading a dict through every call.
     "structlog>=24.1",
+    # The read/control API (PLAN §7). The submission requires a working URL, and
+    # FastAPI gives SSE via StreamingResponse without a second framework.
+    "fastapi>=0.115",
+    # The ASGI server FastAPI needs to actually serve; `[standard]` brings the
+    # uvloop/httptools speedups and the websocket support SSE clients negotiate.
+    "uvicorn[standard]>=0.30",
 ]
 
 [dependency-groups]
@@ -43,6 +49,10 @@ dev = [
     # check are database guarantees: a UNIQUE constraint and a NUMERIC type
     # cannot be verified against a mock of themselves.
     "pytest-asyncio>=0.24",
+    # FastAPI's TestClient is httpx under the hood; ASGITransport lets the API
+    # tests exercise real routing and dependency injection in-process, with no
+    # port bound and no server to race.
+    "httpx>=0.27",
 ]
 
 [build-system]
@@ -63,6 +73,21 @@ extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# api/page.py is one HTML document held in a Python string. Its long lines are
+# CSS selectors and JS expressions, where the 100-column rule buys nothing and
+# wrapping would make the markup harder to read, not easier.
+"src/vigil/api/page.py" = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 forbids function calls in argument defaults, because the call runs once at
+# import and every request then shares the result. FastAPI's `Depends`, `Query`
+# and `Body` are built to be evaluated exactly that way — the object is a marker
+# the framework reads, never mutable per-request state — so the rule is a false
+# positive on the framework's core idiom rather than a smell worth working around.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Body",
+                          "fastapi.Header", "fastapi.Path"]
 
 [tool.mypy]
 python_version = "3.12"

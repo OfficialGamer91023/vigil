@@ -86,13 +86,13 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `worker/` — broker adapter, sense step, six session runners, scheduler loop | ✅ |
 | `config/account.lock` + startup assertion | ✅ |
 | `agent/` — LLM portfolio manager | ⬜ (deterministic fallback is live) |
-| `api/` — FastAPI read + control routes, SSE | ⬜ |
+| `api/` — FastAPI read + control routes, SSE, desk page | ✅ |
 | Redis chain cache · arq LLM queue | ⬜ |
 | `journal/` — daily report, social draft | ⬜ |
-| Docker Compose (`postgres` · `redis` · `migrate` · `worker`) | ✅ |
+| Docker Compose (`postgres` · `redis` · `migrate` · `worker` · `api`) | ✅ |
 | CI | ⬜ |
 
-Tests: 294 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
+Tests: 329 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
 
 ## Quick start
 
@@ -111,6 +111,7 @@ make lock                 # ONCE, on the fresh paper account: write config/accou
 make worker               # the agent — in-process scheduler, no Redis, no API needed
 make cycle C=manage       # one cycle by hand: premarket|open|manage|entry|flatten|postclose
 
+make api                  # the read/control API + desk page on :8000
 make flatten              # emergency: guarded cancel-all + close-all
 
 make build                # build the image
@@ -118,6 +119,23 @@ make up                   # postgres + redis + migrate + worker, detached
 make logs                 # tail the stack
 make down                 # stop it
 ```
+
+The API serves the desk page at `/`, OpenAPI docs at `/docs`, and:
+
+| Route | Auth |
+|---|---|
+| `GET /health` · `/api/state` · `/api/equity` · `/api/cycles[/{id}]` · `/api/gates/stats` · `/api/stream` | public |
+| `POST /api/control/{halt,unhalt,flatten,unflatten}` | **bearer** |
+
+```bash
+curl -XPOST -H "Authorization: Bearer $API_CONTROL_TOKEN" localhost:8000/api/control/halt
+```
+
+An **unset** `API_CONTROL_TOKEN` makes those routes answer `503`, not `200` — a
+missing secret must never read as "no auth required". `tests/test_api_isolation.py`
+walks the API's import graph and fails if any module in `vigil/api/` can reach the
+broker, the submit path or the kernel, so hard rule #6 is checked rather than
+merely documented.
 
 The compose Postgres publishes on **5433**, not 5432, so it coexists with a local
 Postgres instead of fighting it for the port. The local one backs `pytest -m db`;

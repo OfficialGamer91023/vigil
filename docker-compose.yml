@@ -1,10 +1,12 @@
-# postgres · redis · migrate · worker  (PLAN §9)
-#
-# `api` is **not here yet** — `src/vigil/api/` does not exist, and a service whose
-# command cannot start breaks `up` for everything beside it. It joins on Day 3.
+# postgres · redis · migrate · worker · api  (PLAN §9)
 #
 # The single most important line in this file is the *absence* of one: `worker`
 # does not `depends_on` redis. See its comment below.
+#
+# The second most important is that `api` and `worker` are **peers**, not a stack.
+# Neither depends on the other, in either direction. Hard rule #6 says the worker
+# runs correctly with the API stopped; the API is equally happy with the worker
+# stopped, because all it does is read the journal and write control flags.
 
 name: vigil
 
@@ -96,6 +98,49 @@ services:
     # an in-flight cycle finish. Killing it between submitting an entry and
     # resting its profit target is precisely the state §2.6 calls a
     # reconciliation defect.
+
+  api:
+    build: .
+    # One image, two commands (PLAN §9): `worker` and `api` share every dependency
+    # and differ only in the process they start.
+    #
+    # `--host 0.0.0.0` because the default binds loopback *inside the container*,
+    # where nothing else lives — the port mapping would resolve to a closed port
+    # and read like a firewall problem. No `--reload`: watchfiles in a container
+    # burns CPU watching a read-only image.
+    command: ["uvicorn", "vigil.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vigil:vigil@postgres:5432/vigil
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      # **`worker` is deliberately absent**, in both directions. The API reads a
+      # journal and writes flag rows; it has no more need of the worker's process
+      # than the worker has of its. Coupling them here would turn a restart of
+      # either one into a restart of both, on a rule that says the opposite.
+    ports:
+      # Loopback-bound. This service exposes an unauthenticated read surface over
+      # a live trading journal and a token-guarded control plane that can flatten
+      # the book — it has no business listening on every interface of a laptop on
+      # hotel wifi. Public exposure for the demo goes through a Cloudflare Tunnel
+      # (§7), which terminates TLS and opens no inbound port.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      # Hits `/health`, which reports the age of the worker's last cycle rather
+      # than merely proving the route resolved. Note what this does **not** do:
+      # it never marks the API unhealthy because the *worker* is idle. They are
+      # separate processes with separate liveness, and conflating them would have
+      # compose restart a perfectly healthy web server on a quiet market.
+      test: ["CMD-SHELL",
+             "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
 
 volumes:
   pgdata:

@@ -46,6 +46,8 @@ from vigil.config import (
     strategy_config,
     universe_config,
 )
+from vigil.control import FLATTEN_FLAG as _FLATTEN_FLAG
+from vigil.control import HALT_FLAG as _HALT_FLAG
 from vigil.db.repositories import journal as J
 from vigil.db.session import get_session
 from vigil.domain import KernelDecision, OpenStructure, PortfolioState, TradeProposal
@@ -64,8 +66,11 @@ from vigil.worker.sense import MarketView, sense
 log = get_logger(__name__)
 
 # Control flags the API writes and the worker reads (§2.2).
-HALT_FLAG = "halt"
-FLATTEN_FLAG = "flatten"
+# Re-exported from `vigil.control` so the API and the worker cannot drift apart on
+# a string. The API must not import this module (it reaches the broker), so the
+# names live somewhere neither side owns.
+HALT_FLAG = _HALT_FLAG
+FLATTEN_FLAG = _FLATTEN_FLAG
 
 
 @dataclass(slots=True)

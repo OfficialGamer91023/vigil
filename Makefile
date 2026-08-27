@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker cycle flatten cli db migrate lock \
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker api cycle flatten cli db migrate lock \
 	up down logs ps build stack-migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
@@ -56,13 +56,18 @@ smoke:
 worker:
 	$(RUN) python -m vigil.worker.runner
 
+# The read/control API on http://localhost:8000 (desk page at /, docs at /docs).
+# `--reload` here and NOT in compose: on the host you are editing the source.
+api:
+	$(RUN) uvicorn vigil.api.main:app --reload --port 8000
+
 # One cycle by name, for driving the agent by hand:
 #   make cycle C=premarket | open | manage | entry | flatten | postclose
 cycle:
 	$(RUN) python -m vigil.worker.sessions $(C)
 
 # --- Docker Compose (PLAN §9) ------------------------------------------------
-# postgres + redis + migrate + worker. `api` joins on Day 3.
+# postgres + redis + migrate + worker + api.
 #
 # The compose Postgres publishes on **5433**, not 5432, so it coexists with a
 # local Postgres rather than fighting it for the port. Host tooling that should
