@@ -144,3 +144,39 @@ def test_a_warm_vrp_series_ignores_the_realized_vol_proxy() -> None:
     """Once the real distribution exists it wins; the proxy is cold start only."""
     v = classify(snap(rv_history=[0.05 + i / 1000 for i in range(60)]))
     assert v.cold_start is False
+
+
+# --------------------------------------------------------------------------- #
+# Unmeasurable realized vol must fail CLOSED, not open
+# --------------------------------------------------------------------------- #
+
+def test_unmeasurable_realized_vol_stands_down_rather_than_selling() -> None:
+    """The regression this pins is a fail-*open*, which is the dangerous direction.
+
+    Callers used to spell "could not measure realized vol" as `rv_annual = 0.0`.
+    Zero is not a missing number — it is the calmest market that has ever existed,
+    so `vrp_raw` collapsed to `iv_atm`, the realized-vol percentile ranked at the
+    very bottom, and the cold-start proxy *inverts* that into a VRP percentile of
+    100%. A half-day, an IEX outage or the first ten minutes of a session then
+    read as "premium has never been richer" and the router sold into it at full
+    size. A missing measurement became maximum conviction.
+    """
+    calm = [0.05 + i / 1000 for i in range(60)]
+    v = classify(snap(vrp_history=[], rv_annual=None, rv_history=calm))
+
+    assert v.regime is Regime.STRESS
+    assert v.structure is None                    # no structure at all, not a small one
+    assert v.size_multiplier == Decimal(0)
+    assert "unmeasurable" in v.reason
+
+
+def test_unmeasurable_realized_vol_leaves_vrp_raw_uncomputable() -> None:
+    """`None` propagates rather than being papered over with a zero."""
+    assert snap(rv_annual=None).vrp_raw is None
+    assert snap(rv_annual=0.12).vrp_raw == 0.18 - 0.12
+
+
+def test_the_stand_down_outranks_a_tradeable_looking_gap() -> None:
+    """Ordering: with no VRP read there is no regime read, so nothing else applies."""
+    v = classify(snap(vrp_history=[], rv_annual=None, rv_history=[], iv_atm=0.30))
+    assert v.structure is None

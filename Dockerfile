@@ -22,7 +22,7 @@ WORKDIR /app
 # reinstall alpaca-py, sqlalchemy and the rest. `--no-install-project` is what
 # makes that possible: it resolves and installs the dependency tree while
 # deliberately skipping `vigil` itself, which is not present yet.
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # `--frozen` refuses to update uv.lock. In an image build that is the whole point:
@@ -30,7 +30,12 @@ RUN uv sync --frozen --no-dev --no-install-project
 # does not match what the tests ran against. `--no-dev` keeps pytest, mypy, ruff
 # and hypothesis out of the runtime image — they are PEP 735 dev dependencies and
 # nothing in production imports them.
+# README.md comes in here rather than with the manifests above, even though
+# `pyproject.toml` names it as `readme`. It is only needed by the second sync —
+# the one that actually builds `vigil` — and copying it into the first layer
+# would make every README edit invalidate the cached dependency install.
 COPY src/ ./src/
+COPY README.md ./
 RUN uv sync --frozen --no-dev
 
 

@@ -34,7 +34,15 @@ class MarketSnapshot:
     session_open: Decimal
     daily_closes: list[float]
     iv_atm: float
-    rv_annual: float
+    # **Optional, and `None` is not the same as `0.0`.** Realized vol is
+    # unmeasurable often enough to matter — a half day, an IEX outage, the first
+    # ten minutes of a session. Typing it `float` forced every caller to spell
+    # that case `rv or 0.0`, which is the single most dangerous value it could
+    # take: `vrp_raw` collapses to `iv_atm`, the realized-vol percentile ranks at
+    # the very bottom, the cold-start proxy inverts that to 100%, and the router
+    # reads "premium has never been richer — sell." A missing measurement became
+    # maximum conviction. `None` makes it a stand-down instead.
+    rv_annual: float | None
     # Trailing distributions. Short history is not an error — it triggers the
     # documented cold-start path rather than a silent guess.
     vrp_history: list[float]
@@ -45,8 +53,15 @@ class MarketSnapshot:
     rv_history: list[float] = field(default_factory=list)
 
     @property
-    def vrp_raw(self) -> float:
-        """IV minus realized vol, both annualized. Bug 1 is fixed upstream of here."""
+    def vrp_raw(self) -> float | None:
+        """IV minus realized vol, both annualized. Bug 1 is fixed upstream of here.
+
+        `None` when realized vol could not be measured: the difference is not
+        computable, and inventing a zero for the missing half would make it look
+        like it was.
+        """
+        if self.rv_annual is None:
+            return None
         return self.iv_atm - self.rv_annual
 
 
@@ -64,7 +79,7 @@ class RegimeVerdict:
     iv_pct: float | None = None
 
 
-def _cold_start_vrp_pct(snap: MarketSnapshot) -> float:
+def _cold_start_vrp_pct(snap: MarketSnapshot) -> float | None:
     """Stand in for the VRP percentile before 60 sessions of `vrp_raw` exist.
 
     **Why a stand-in is needed at all.** `vrp_raw = iv_atm − rv_annual`, and the
@@ -89,15 +104,26 @@ def _cold_start_vrp_pct(snap: MarketSnapshot) -> float:
     direct statement of it than the VRP formulation. It is still a proxy, and the
     verdict is still flagged `cold_start`, because the assumption that IV is
     stable is exactly the thing that fails on the days this matters most.
+
+    **When the proxy is unavailable too.** The proxy *is* today's realized vol, so
+    without it there is no proxy — and §4.3.1's own absolute test (`vrp_raw > 0`)
+    needs the same missing number. Returning `None` says "cannot assess", which
+    the router turns into a stand-down. A deliberate fail-closed: the alternative
+    reading, *"no evidence vol is expensive, therefore sell"*, is how a data
+    outage becomes a position.
     """
+    if snap.rv_annual is None:
+        return None
     if snap.rv_history:
         rv_pct = percentile_rank(snap.rv_annual, snap.rv_history)
         if rv_pct is not None:
             # High realized vol -> low VRP percentile. The inversion is the point.
             return 1.0 - rv_pct
-    # No backfill either. Fall back to §4.3.1's absolute test, degenerate as it is
-    # — a weak signal that is honestly labelled beats an exception at 09:31.
-    return 1.0 if snap.vrp_raw > 0 else 0.0
+    # No backfill, but today's RV is measured. Fall back to §4.3.1's absolute
+    # test, degenerate as it is — a weak signal honestly labelled beats an
+    # exception at 09:31.
+    raw = snap.vrp_raw
+    return 1.0 if raw is not None and raw > 0 else 0.0
 
 
 def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVerdict:
@@ -105,7 +131,8 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
     c = cfg or regime_config()
 
     trend = trend_score(snap.daily_closes, c.ema_fast, c.ema_slow)
-    vrp_pct = percentile_rank(snap.vrp_raw, snap.vrp_history)
+    raw = snap.vrp_raw
+    vrp_pct = percentile_rank(raw, snap.vrp_history) if raw is not None else None
     iv_pct = percentile_rank(snap.iv_atm, snap.iv_history)
     gap = gap_pct(snap.session_open, snap.prev_close)
 
@@ -130,7 +157,16 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
             trend=trend, vrp_pct=vrp_pct, iv_pct=iv_pct,
         )
 
-    # STRESS first: it is a veto, and it must be able to override a setup that
+    # **Unmeasurable comes before everything, including the gap test.** If the VRP
+    # input is missing there is no regime read at all, and a router that answered
+    # anyway would be guessing with the confidence of a measurement.
+    if vrp_pct is None:
+        return verdict(
+            Regime.STRESS, None,
+            "realized vol unmeasurable this cycle — no VRP read, standing down",
+            size_multiplier=Decimal(0))
+
+    # STRESS next: it is a veto, and it must be able to override a setup that
     # otherwise looks tradeable. Short vol into a moving market is how accounts die.
     if abs(gap) > c.stress_gap_pct:
         return verdict(

@@ -16,6 +16,7 @@ import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
 
+from vigil.clock import today_et
 from vigil.data.bars import daily_closes, prev_close_and_open, session_closes
 from vigil.data.chain import Contract
 from vigil.signals.history import rv_history
@@ -64,14 +65,23 @@ async def sense(
     )
 
     warnings: list[str] = []
-    rv = realized_vol(session)
+    rv = realized_vol(session.closes)
     if rv is None:
-        # Not fatal, but it must not pass silently: `rv_annual = 0` collapses
-        # `vrp_raw` to `iv_atm`, which makes every VRP figure downstream a
-        # confident wrong answer rather than a missing one.
+        # Passed to the snapshot as `None`, never as `0.0`. Zero is not a missing
+        # measurement, it is the *calmest possible market*, and the cold-start
+        # proxy would invert it into "premium has never been richer — sell."
+        # `None` makes the router stand down instead.
         warnings.append(
-            f"only {len(session)} 5-min bars for {underlying}; realized vol "
-            f"unavailable and VRP is unreliable this cycle"
+            f"only {len(session.closes)} regular-hours 5-min bars for "
+            f"{underlying}; realized vol unmeasurable — the router will stand down"
+        )
+    elif session.date is not None and session.date != today_et():
+        # Before ~10:20 the current session has too few bars to measure, so the
+        # honest number is yesterday's. Say which day it is rather than letting a
+        # stale-but-valid figure read as today's tape.
+        warnings.append(
+            f"{underlying} realized vol is from {session.date}, not today — "
+            f"the current session has fewer than the minimum bars so far"
         )
     if not chain:
         warnings.append(f"no live {underlying} chain in window")
@@ -87,7 +97,7 @@ async def sense(
         session_open=session_open,
         daily_closes=closes,
         iv_atm=atm.iv or 0.0,
-        rv_annual=rv or 0.0,
+        rv_annual=rv,
         # No historical implied vol on the free tier, so these accumulate forward
         # one session at a time; empty drops the router onto the documented
         # cold-start path (§4.3.1) rather than onto a guess.

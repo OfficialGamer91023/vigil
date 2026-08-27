@@ -89,10 +89,10 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `api/` — FastAPI read + control routes, SSE | ⬜ |
 | Redis chain cache · arq LLM queue | ⬜ |
 | `journal/` — daily report, social draft | ⬜ |
-| Docker Compose (`postgres` · `redis` · `migrate` · `worker`) | ✅ (unbuilt — see below) |
+| Docker Compose (`postgres` · `redis` · `migrate` · `worker`) | ✅ |
 | CI | ⬜ |
 
-Tests: 285 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
+Tests: 294 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
 
 ## Quick start
 
@@ -119,6 +119,13 @@ make logs                 # tail the stack
 make down                 # stop it
 ```
 
+The compose Postgres publishes on **5433**, not 5432, so it coexists with a local
+Postgres instead of fighting it for the port. The local one backs `pytest -m db`;
+the compose one backs the containerised worker.
+
+`worker` deliberately does **not** `depends_on` redis — hard rule #6 says the
+agent runs with Redis stopped, and `docker compose stop redis` is that claim
+being demonstrable rather than asserted.
 
 Until `config/account.lock` exists every cycle refuses to start, naming the account
 the current `.env` actually resolves to. That is hard rule #7 working, not a setup bug.

@@ -19,16 +19,25 @@ fetch is two places for the feed, the lookback or the bar size to drift apart.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, time, timedelta
 from decimal import Decimal
 
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from vigil.clock import now_et
+from vigil.clock import ET, now_et
 from vigil.data.alpaca_client import stock_data_client
 from vigil.data.chain import STOCK_FEED
-from vigil.signals.vol import BARS_PER_SESSION
+from vigil.signals.vol import MIN_BARS
+
+# The regular session. Bars outside it are excluded for the same reason
+# `scripts/backfill_vrp.py` excludes them: pre- and post-market prints on IEX are
+# thin, and their gaps are not intraday movement. The two constructions have to
+# match exactly, because one is ranked against the other.
+REGULAR_OPEN = time(9, 30)
+REGULAR_CLOSE = time(16, 0)
 
 
 def daily_closes(symbol: str, *, days: int = 60) -> list[float]:
@@ -49,12 +58,46 @@ def daily_closes(symbol: str, *, days: int = 60) -> list[float]:
     return [float(b.close) for b in stock_data_client().get_stock_bars(req)[symbol]]
 
 
-def session_closes(symbol: str, *, sessions: int = 3) -> list[float]:
-    """Recent 5-minute closes, trimmed to the most recent session's worth.
+@dataclass(frozen=True, slots=True)
+class SessionBars:
+    """One session's 5-minute closes, and **which** session they are.
 
-    Trimmed because realized vol is a statement about today's tape, not about the
-    average of the last week — and a window spanning an overnight gap would fold
-    that gap into an intraday volatility estimate.
+    The date is carried rather than assumed because `session_closes` legitimately
+    returns *yesterday* early in the morning, and a realized-vol number whose
+    session is unknown cannot be reported honestly — the difference between "vol
+    is calm today" and "vol was calm yesterday" is the whole signal at 09:45.
+    """
+
+    date: date | None
+    closes: list[float]
+
+    def __bool__(self) -> bool:
+        return bool(self.closes)
+
+
+def session_closes(symbol: str, *, sessions: int = 3) -> SessionBars:
+    """The most recent *complete-enough* session's 5-minute closes, oldest first.
+
+    **This used to be `bars[-78:]`, and that was wrong in a way the old docstring
+    denied.** Slicing the last 78 bars claims to take "one session's worth", but
+    78 is the length of a *finished* session. Ask at 09:45 and today has three
+    bars, so the window is 75 bars of yesterday, the overnight gap, and three bars
+    of today — a number describing yesterday's tape, labelled as today's, at the
+    exact cycle that sets the day's plan. Ask at 12:00 and it is still a
+    gap-spanning blend.
+
+    That matters because this number is not read on its own: it is ranked against
+    `signals.history.rv_history`, which `backfill_vrp.py` builds **per session,
+    regular hours only**. A live estimate that folds in an overnight gap and a
+    handful of thin extended-hours prints is ranked against a distribution that
+    contains neither, so it sits systematically too high — and since the
+    cold-start proxy *inverts* the realized-vol percentile, systematically too
+    high reads as "vol is expensive, do not sell premium." The router stands down
+    on days it should trade.
+
+    So: group by Eastern session date, keep regular hours only, and return the
+    most recent session that actually has enough bars to measure. Early in the
+    morning that is yesterday, reported as yesterday.
     """
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -65,7 +108,22 @@ def session_closes(symbol: str, *, sessions: int = 3) -> list[float]:
         feed=STOCK_FEED,
     )
     bars = stock_data_client().get_stock_bars(req)[symbol]
-    return [float(b.close) for b in bars][-BARS_PER_SESSION:]
+
+    by_session: dict[date, list[float]] = defaultdict(list)
+    for bar in bars:
+        ts = bar.timestamp.astimezone(ET)
+        if not (REGULAR_OPEN <= ts.time() < REGULAR_CLOSE):
+            continue
+        by_session[ts.date()].append(float(bar.close))
+
+    # Newest first, and take the first session with enough bars for `realized_vol`
+    # to accept. Falling back a session beats returning a stub that `realized_vol`
+    # rejects, because a rejected estimate becomes `rv_annual = None` downstream —
+    # and the router treats "cannot measure" as a stand-down.
+    for day in sorted(by_session, reverse=True):
+        if len(by_session[day]) >= MIN_BARS:
+            return SessionBars(day, by_session[day])
+    return SessionBars(None, [])
 
 
 def prev_close_and_open(closes: list[float], spot: Decimal) -> tuple[Decimal, Decimal]:

@@ -54,10 +54,14 @@ def run(underlying: str) -> bool:
     spot = spot_price(underlying)
     closes = daily_closes(underlying)
     session = session_closes(underlying)
-    rv = realized_vol(session)
+    rv = realized_vol(session.closes)
     if rv is None:
-        print(f"  NOTE: only {len(session)} 5-min bars available; realized vol is "
-              f"unavailable and every VRP figure below is unreliable.")
+        print(f"  NOTE: only {len(session.closes)} regular-hours 5-min bars "
+              f"available; realized vol is unmeasurable and the router will "
+              f"stand down.")
+    elif session.date != today_et():
+        print(f"  NOTE: realized vol is from {session.date}, not today — the "
+              f"current session has fewer than the minimum bars so far.")
 
     prev_close, session_open = prev_close_and_open(closes, spot)
     snap = MarketSnapshot(
@@ -67,7 +71,7 @@ def run(underlying: str) -> bool:
         session_open=session_open,
         daily_closes=closes,
         iv_atm=0.0,
-        rv_annual=rv or 0.0,
+        rv_annual=rv,
         vrp_history=[],
         iv_history=[],
         # Backfilled by `make vrp`. Empty until then, which drops the router onto
