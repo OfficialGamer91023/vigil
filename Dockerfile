@@ -22,7 +22,7 @@ WORKDIR /app
 # reinstall alpaca-py, sqlalchemy and the rest. `--no-install-project` is what
 # makes that possible: it resolves and installs the dependency tree while
 # deliberately skipping `vigil` itself, which is not present yet.
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # `--frozen` refuses to update uv.lock. In an image build that is the whole point:

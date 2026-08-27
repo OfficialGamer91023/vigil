@@ -119,16 +119,6 @@ make logs                 # tail the stack
 make down                 # stop it
 ```
 
-The compose Postgres publishes on **5433**, not 5432, so it coexists with a local
-Postgres instead of fighting it for the port. `worker` deliberately does **not**
-`depends_on` redis — hard rule #6 says the agent runs with Redis stopped, and
-`docker compose stop redis` is that claim being demonstrable rather than asserted.
-
-> The Compose stack has **not been built or run** — there is no Docker on the
-> machine it was written on. The Dockerfile's dependency set was verified by
-> installing `--frozen --no-dev` into a throwaway venv and starting the worker
-> from it, and the YAML and every `COPY` path were checked statically, but
-> `docker compose up` itself is unrun. Treat the first `make up` as a real test.
 
 Until `config/account.lock` exists every cycle refuses to start, naming the account
 the current `.env` actually resolves to. That is hard rule #7 working, not a setup bug.
