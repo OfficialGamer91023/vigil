@@ -29,12 +29,16 @@ from zoneinfo import ZoneInfo
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
+from vigil.config import universe_config
 from vigil.data.alpaca_client import stock_data_client
 from vigil.data.chain import STOCK_FEED
 from vigil.settings import REPO_ROOT
 from vigil.signals.vol import realized_vol
 
-DEFAULT_UNIVERSE = ["SPY", "QQQ"]
+# The primary universe comes from config/universe.yaml, not from a literal here:
+# three scripts repeating ["SPY", "QQQ"] is three places to forget when the
+# universe changes. Pass symbols on the command line to override.
+DEFAULT_UNIVERSE = list(universe_config().primary)
 SESSIONS = 60
 ET = ZoneInfo("America/New_York")
 OUT_DIR = REPO_ROOT / "data" / "raw"

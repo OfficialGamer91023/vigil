@@ -15,7 +15,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 from vigil.clock import is_market_open, now_et, today_et
-from vigil.config import risk_config, strategy_config
+from vigil.config import risk_config, strategy_config, universe_config
 from vigil.data.alpaca_client import stock_data_client, trading_client
 from vigil.data.chain import STOCK_FEED, fetch_chain, fetch_open_interest, spot_price
 from vigil.domain import PortfolioState
@@ -26,7 +26,10 @@ from vigil.signals.regime import MarketSnapshot, classify
 from vigil.signals.vol import BARS_PER_SESSION, realized_vol
 from vigil.strategy.candidates import build_for_regime
 
-DEFAULT_UNIVERSE = ["SPY", "QQQ"]
+# The primary universe comes from config/universe.yaml, not from a literal here:
+# three scripts repeating ["SPY", "QQQ"] is three places to forget when the
+# universe changes. Pass symbols on the command line to override.
+DEFAULT_UNIVERSE = list(universe_config().primary)
 
 
 def _daily_closes(symbol: str, days: int = 60) -> list[float]:

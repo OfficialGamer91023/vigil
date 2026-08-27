@@ -1,9 +1,10 @@
 """Async engine and session factory.
 
-**Async because the worker is async.** The trading loop runs under `arq`, and a
-blocking database call inside a cycle would stall the event loop that is also
-waiting on the broker — during a manage sweep that is the difference between a
-15:40 flatten firing at 15:40 and firing whenever the write finished.
+**Async because the worker is async.** The trading loop is driven in-process by
+`vigil.worker.schedule` (not by arq — see that module for why), and a blocking
+database call inside a cycle would stall the event loop that is also waiting on
+the broker. During a manage sweep that is the difference between a 15:40 flatten
+firing at 15:40 and firing whenever the write finished.
 
 The URL is read from `DATABASE_URL` and normalised to the `asyncpg` driver, so a
 plain `postgresql://` copied from anywhere still works rather than failing with

@@ -37,14 +37,17 @@ from zoneinfo import ZoneInfo
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from vigil.config import RegimeConfig, regime_config, risk_config
+from vigil.config import RegimeConfig, regime_config, risk_config, universe_config
 from vigil.data.alpaca_client import stock_data_client
 from vigil.data.chain import STOCK_FEED
 from vigil.signals.regime import MarketSnapshot, classify
 from vigil.signals.vol import realized_vol
 
 ET = ZoneInfo("America/New_York")
-DEFAULT_UNIVERSE = ["SPY", "QQQ"]
+# The primary universe comes from config/universe.yaml, not from a literal here:
+# three scripts repeating ["SPY", "QQQ"] is three places to forget when the
+# universe changes. Pass symbols on the command line to override.
+DEFAULT_UNIVERSE = list(universe_config().primary)
 SESSIONS = 60
 # The §2.4 cron: entry evaluation every 30 minutes, 10:30-14:30 ET.
 ENTRY_SLOTS = [time(10, 30), time(11, 0), time(11, 30), time(12, 0),
