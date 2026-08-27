@@ -339,3 +339,30 @@ async def test_gate_stats_report_passes_as_well_as_failures(client, clean_db) ->
     A rejection tally alone cannot tell those two apart, so both counts ship.
     """
     assert (await client.get("/api/gates/stats")).json() == []
+
+
+def test_the_desk_pages_javascript_parses() -> None:
+    """The demo URL's only client-side logic, and nothing else exercises it.
+
+    A syntax error in this string is invisible to every other test here — the
+    route still returns 200, the HTML still contains a `<title>` — and shows up
+    only as a blank page in front of a judge. Skipped rather than failed where
+    node is unavailable: a missing linter is not a broken page.
+    """
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    from vigil.api.page import HTML
+
+    script = re.search(r"<script>(.*?)</script>", HTML, re.S)
+    assert script is not None, "the desk page has lost its script block"
+
+    result = subprocess.run(
+        [node, "--check", "-"], input=script.group(1), capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
