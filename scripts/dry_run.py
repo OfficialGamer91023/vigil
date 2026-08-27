@@ -16,64 +16,21 @@ from decimal import Decimal
 
 from vigil.clock import is_market_open, now_et, today_et
 from vigil.config import risk_config, strategy_config, universe_config
-from vigil.data.alpaca_client import stock_data_client, trading_client
-from vigil.data.chain import STOCK_FEED, fetch_chain, fetch_open_interest, spot_price
+from vigil.data.alpaca_client import trading_client
+from vigil.data.bars import daily_closes, prev_close_and_open, session_closes
+from vigil.data.chain import fetch_chain, fetch_open_interest, spot_price
 from vigil.domain import PortfolioState
 from vigil.risk.context import KernelContext
 from vigil.risk.kernel import evaluate
 from vigil.signals.history import rv_history
 from vigil.signals.regime import MarketSnapshot, classify
-from vigil.signals.vol import BARS_PER_SESSION, realized_vol
+from vigil.signals.vol import realized_vol
 from vigil.strategy.candidates import build_for_regime
 
 # The primary universe comes from config/universe.yaml, not from a literal here:
 # three scripts repeating ["SPY", "QQQ"] is three places to forget when the
 # universe changes. Pass symbols on the command line to override.
 DEFAULT_UNIVERSE = list(universe_config().primary)
-
-
-def _daily_closes(symbol: str, days: int = 60) -> list[float]:
-    from datetime import timedelta
-
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Day,
-        start=now_et() - timedelta(days=int(days * 1.6)),
-        end=now_et(),
-        feed=STOCK_FEED,
-    )
-    return [float(b.close) for b in stock_data_client().get_stock_bars(req)[symbol]]
-
-
-def _session_closes(symbol: str, sessions: int = 3) -> list[float]:
-    """Recent 5-minute closes — the input `realized_vol` actually needs.
-
-    This used to be `[float(spot)] * 40`, a constant series whose standard
-    deviation is zero. That made `rv_annual` 0, which made `vrp_raw` collapse to
-    `iv_atm`, which made every VRP number the dry run printed meaningless while
-    looking entirely plausible. A stub that silently produces a *confident wrong
-    answer* is worse than one that fails.
-    """
-    from datetime import timedelta
-
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-        # Calendar days, so the window is widened to survive a weekend.
-        start=now_et() - timedelta(days=sessions * 3),
-        end=now_et(),
-        feed=STOCK_FEED,
-    )
-    bars = stock_data_client().get_stock_bars(req)[symbol]
-    # Only the most recent session's worth: realized vol is a statement about
-    # today's tape, not about the average of the last week.
-    return [float(b.close) for b in bars][-BARS_PER_SESSION:]
 
 
 def _live_portfolio() -> PortfolioState:
@@ -95,18 +52,19 @@ def run(underlying: str) -> bool:
     print(f"\n{'=' * 72}\n{underlying}\n{'=' * 72}")
 
     spot = spot_price(underlying)
-    closes = _daily_closes(underlying)
-    session = _session_closes(underlying)
+    closes = daily_closes(underlying)
+    session = session_closes(underlying)
     rv = realized_vol(session)
     if rv is None:
         print(f"  NOTE: only {len(session)} 5-min bars available; realized vol is "
               f"unavailable and every VRP figure below is unreliable.")
 
+    prev_close, session_open = prev_close_and_open(closes, spot)
     snap = MarketSnapshot(
         underlying=underlying,
         spot=spot,
-        prev_close=Decimal(str(closes[-2])) if len(closes) > 1 else spot,
-        session_open=Decimal(str(closes[-1])) if closes else spot,
+        prev_close=prev_close,
+        session_open=session_open,
         daily_closes=closes,
         iv_atm=0.0,
         rv_annual=rv or 0.0,

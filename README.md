@@ -83,15 +83,15 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `execution/` — mleg, price ladder, router, reconcile, manage | ✅ |
 | `db/` — 12 tables, repositories, initial Alembic migration | ✅ |
 | `worker/` — pure cron table (`datetime → due cycles`) | ✅ |
-| `worker/` — session runners driving the cycle | ⬜ |
-| `config/account.lock` + startup assertion | ⬜ |
-| `agent/` — LLM portfolio manager | ⬜ |
+| `worker/` — broker adapter, sense step, six session runners, scheduler loop | ✅ |
+| `config/account.lock` + startup assertion | ✅ |
+| `agent/` — LLM portfolio manager | ⬜ (deterministic fallback is live) |
 | `api/` — FastAPI read + control routes, SSE | ⬜ |
 | Redis chain cache · arq LLM queue | ⬜ |
 | `journal/` — daily report, social draft | ⬜ |
 | Docker Compose · CI | ⬜ |
 
-Tests: 241 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
+Tests: 285 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
 
 ## Quick start
 
@@ -105,8 +105,16 @@ make lint                 # ruff + mypy
 
 make measure              # re-verify the three load-bearing assumptions against a live chain
 make dry-run              # full pipeline — sense → regime → build → gate. Submits nothing.
+
+make lock                 # ONCE, on the fresh paper account: write config/account.lock
+make worker               # the agent — in-process scheduler, no Redis, no API needed
+make cycle C=manage       # one cycle by hand: premarket|open|manage|entry|flatten|postclose
+
 make flatten              # emergency: guarded cancel-all + close-all
 ```
+
+Until `config/account.lock` exists every cycle refuses to start, naming the account
+the current `.env` actually resolves to. That is hard rule #7 working, not a setup bug.
 
 ## Licence
 

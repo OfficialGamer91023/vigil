@@ -17,6 +17,9 @@ __pycache__/
 data/raw/
 *.local.json
 
+# Knowledge-graph extraction output (generated, ~3MB, regenerated on demand)
+graphify-out/
+
 # OS / editor
 .DS_Store
 .idea/

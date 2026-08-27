@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run flatten cli db migrate clean
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker cycle flatten cli db migrate lock clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -48,6 +48,18 @@ dry-run:
 smoke:
 	$(RUN) python scripts/a4_mleg_smoke.py
 
+# --- The agent (PLAN §2.3) --------------------------------------------------
+# The in-process scheduler. No Redis, no API, no web — hard rule #6 says the
+# worker must run correctly with all three stopped, and this is that claim being
+# true rather than asserted.
+worker:
+	$(RUN) python -m vigil.worker.runner
+
+# One cycle by name, for driving the agent by hand:
+#   make cycle C=premarket | open | manage | entry | flatten | postclose
+cycle:
+	$(RUN) python -m vigil.worker.sessions $(C)
+
 # --- Journal (PLAN §3) ------------------------------------------------------
 # Creates the database if it is missing. Migrations never run create_all()
 # against a real database (CLAUDE.md) — the schema only ever moves via Alembic.
@@ -58,6 +70,12 @@ db:
 
 migrate: db
 	$(RUN) alembic upgrade head
+
+# --- The account lock (hard rule #7) ----------------------------------------
+# Run ONCE on the fresh paper account, before Day 1. Startup refuses to trade any
+# account whose id does not match config/account.lock.
+lock:
+	$(RUN) python scripts/lock_account.py
 
 # --- Ops (PLAN §2.1) --------------------------------------------------------
 # The CLI is a separate tool, not a project dependency: alpaca-cli requires

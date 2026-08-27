@@ -24,6 +24,9 @@ dependencies = [
     "asyncpg>=0.29",
     # Schema changes go through migrations, never create_all() (CLAUDE.md).
     "alembic>=1.13",
+    # JSON-line logs where every line carries session_id and cycle_id: `bind()`
+    # attaches cycle context once instead of threading a dict through every call.
+    "structlog>=24.1",
 ]
 
 [dependency-groups]

@@ -7,13 +7,18 @@ bounded by an ATM strike window and an explicit expiry range.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
 
 from alpaca.data.enums import DataFeed
 from alpaca.data.models.snapshots import OptionsSnapshot
-from alpaca.data.requests import OptionChainRequest, StockLatestTradeRequest
+from alpaca.data.requests import (
+    OptionChainRequest,
+    OptionLatestQuoteRequest,
+    StockLatestTradeRequest,
+)
 from alpaca.trading.enums import ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
 
@@ -178,3 +183,34 @@ def fetch_open_interest(
         page_token = getattr(page, "next_page_token", None)
         if not page_token:
             return out
+
+
+def fetch_quotes(symbols: Sequence[str]) -> dict[str, tuple[Decimal, Decimal]]:
+    """Latest bid/ask for specific OCC symbols. `{symbol: (bid, ask)}`.
+
+    **Why this exists alongside `fetch_chain`.** Chain fetches are bounded by an
+    ATM strike window, which is right for *finding* a trade. It is wrong for
+    *exiting* one: a structure worth closing is usually one the underlying has
+    moved toward, and a fast move can carry a short strike straight out of the
+    window. Pricing a close from a window fetch would then silently fail to find
+    the very legs that most need closing — at 15:39, on a position that must not
+    be held into auto-exercise.
+
+    So closes quote their legs by symbol. It is also cheaper: one request for the
+    two-to-four contracts we actually hold, rather than a hundred we do not.
+
+    Symbols with no two-sided quote are **omitted, not zero-filled**. A caller
+    that cannot price a leg must know that, because a zero bid would price the
+    package as worthless and submit a limit to match.
+    """
+    if not symbols:
+        return {}
+    req = OptionLatestQuoteRequest(symbol_or_symbols=list(symbols), feed=OPTIONS_FEED)
+    quotes = option_data_client().get_option_latest_quote(req)
+    out: dict[str, tuple[Decimal, Decimal]] = {}
+    for symbol, q in quotes.items():
+        bid, ask = getattr(q, "bid_price", None), getattr(q, "ask_price", None)
+        if bid is None or ask is None or ask <= 0:
+            continue
+        out[symbol] = (Decimal(str(bid)), Decimal(str(ask)))
+    return out

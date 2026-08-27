@@ -9,6 +9,7 @@ means cancel-and-log, not "take whatever is there."
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
@@ -179,3 +180,50 @@ def premium_multiple_target_price(net_debit: Decimal, multiple: Decimal) -> Deci
     """
     price = round_to_tick(abs(net_debit) * multiple, favour_us=False)
     return max(price, TICK)
+
+
+def package_mid(legs: Sequence[tuple[Decimal, Decimal, bool]]) -> Decimal:
+    """Signed mid of a whole package: `(bid, ask, is_short)` per leg.
+
+    **Signed the same way `TradeProposal.net_credit` is** — positive means the
+    package collects premium — so a structure's current value can be compared
+    against the credit it was opened for without either side reinterpreting the
+    convention. A short leg contributes `+mid` (we sold it and would pay to buy
+    it back); a long leg contributes `−mid`.
+    """
+    total = Decimal(0)
+    for bid, ask, is_short in legs:
+        mid = (bid + ask) / 2
+        total += mid if is_short else -mid
+    return total
+
+
+def closing_limit(
+    package_value: Decimal, *, slippage_pct: Decimal = Decimal("0.10")
+) -> Decimal:
+    """The limit to close a package currently worth `package_value` (signed).
+
+    Returns a **positive magnitude**, like every other limit in this codebase:
+    direction is carried by each leg's `position_intent`, never by the sign of
+    the package price.
+
+    **Closes concede, entries do not.** An entry that does not fill costs
+    nothing — §2.5 says as much, and the ladder simply gives up at the kernel's
+    price boundary. A close that does not fill costs a position held into
+    auto-exercise, so this crosses the mid by `slippage_pct` in the direction
+    that gets filled: paying more to buy a package back, accepting less to sell
+    one. That asymmetry is deliberate and is the reason this is not just
+    `package_mid` with a rounding call.
+
+    Still a **limit** order, never a market order (hard rule #5). Conceding a
+    known 10% on an indicative quote is a bounded cost; a market order on the
+    same quote is an unbounded one.
+    """
+    magnitude = abs(package_value)
+    if package_value >= 0:
+        # We are buying the package back: bid up from the mid.
+        price = magnitude * (Decimal(1) + slippage_pct)
+    else:
+        # We are selling it back: accept below the mid.
+        price = magnitude * (Decimal(1) - slippage_pct)
+    return max(round_to_tick(price, favour_us=False), TICK)
