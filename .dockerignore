@@ -1,0 +1,44 @@
+# **This file is a security control, not only a build-speed one.**
+#
+# Docker sends the whole build context to the daemon, and anything COPY'd lands
+# in an image layer permanently — deleting it in a later layer does not remove it
+# from the image, it only hides it. A `.env` that reaches a layer is a leaked key
+# (hard rule #2), so the secret-bearing entries below are load-bearing.
+
+# --- secrets. Never in an image, never in the context. ---------------------- #
+.env
+.env.*
+!.env.example
+config/*.local.yaml
+
+# --- the host's virtualenv --------------------------------------------------- #
+# Built for macOS/arm64 against the host's interpreter. Copying it into a Linux
+# image produces a venv whose binaries cannot run and whose .pth files point at
+# paths that do not exist — and it would silently shadow the one uv builds.
+.venv/
+venv/
+
+# --- regenerated or machine-local ------------------------------------------- #
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+graphify-out/
+
+# `data/raw/` is the backfilled realized-vol series for the regime cold start
+# (§4.3.1). Deliberately NOT baked in: it is regenerated with `make vrp` and goes
+# stale daily, so compose mounts it as a volume instead. An image carrying a
+# week-old series would look correct and reason from dead data.
+data/raw/
+
+# --- not needed at run time -------------------------------------------------- #
+.git/
+.github/
+tests/
+docs/
+web/
+*.md
+!README.md
+.DS_Store

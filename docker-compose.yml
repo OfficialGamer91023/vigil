@@ -1,0 +1,101 @@
+# postgres · redis · migrate · worker  (PLAN §9)
+#
+# `api` is **not here yet** — `src/vigil/api/` does not exist, and a service whose
+# command cannot start breaks `up` for everything beside it. It joins on Day 3.
+#
+# The single most important line in this file is the *absence* of one: `worker`
+# does not `depends_on` redis. See its comment below.
+
+name: vigil
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vigil
+      POSTGRES_PASSWORD: vigil
+      POSTGRES_DB: vigil
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Published on **5433**, not 5432, because a developer machine running this
+    # project almost certainly already has a local Postgres on the default port —
+    # this one does. Mapping onto it fails the whole stack with "port is already
+    # allocated", and the two databases are wanted for different jobs anyway: the
+    # local one backs `pytest -m db`, this one backs the containerised worker.
+    # Reach it with:  postgresql+asyncpg://vigil:vigil@localhost:5433/vigil
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      # **A healthcheck, not a bare `depends_on`.** Plain `depends_on` waits for
+      # the *container* to start, not for Postgres to accept connections — and
+      # Postgres always rejects connections for a second or two while it
+      # initialises. Without this the migration races the database and loses,
+      # roughly one start in three, which is exactly the kind of flake that gets
+      # diagnosed as "Docker being weird".
+      test: ["CMD-SHELL", "pg_isready -U vigil -d vigil"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    # Nothing connects to Redis yet — the chain cache and the arq LLM queue are
+    # Day 3. It is here now because it makes hard rule #6 **demonstrable rather
+    # than asserted**: `docker compose stop redis` and the worker keeps trading,
+    # which is a claim worth being able to run on camera.
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vigil:vigil@postgres:5432/vigil
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # A one-shot job, not a service: it runs to completion and exits 0. Schema
+    # changes go through Alembic and never through `create_all()` (CLAUDE.md), so
+    # the container gets the same discipline the host does rather than a
+    # convenient exception.
+    restart: "no"
+
+  worker:
+    build: .
+    command: ["python", "-m", "vigil.worker.runner"]
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vigil:vigil@postgres:5432/vigil
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        # Wait for the migration to *finish*, not merely to start. Without this
+        # the worker races a half-applied schema and dies on its first query.
+        condition: service_completed_successfully
+      # **redis is deliberately absent from this list.** Hard rule #6: the worker
+      # must run correctly with `api`, `web` and Redis all stopped. A
+      # `depends_on: redis` would make that false at the orchestration layer no
+      # matter how careful the Python is — compose would refuse to start the
+      # agent because a cache was down.
+    volumes:
+      # The backfilled realized-vol series for the regime cold start (§4.3.1).
+      # Mounted rather than baked because `make vrp` regenerates it daily; an
+      # image carrying a week-old series would look correct and reason from dead
+      # data. Read-only: the worker consumes this series and never writes it.
+      - ./data/raw:/app/data/raw:ro
+    # §14: "a watchdog restarts a stale stack". The runner already survives a
+    # failed cycle on its own; this covers the process dying outright.
+    restart: unless-stopped
+    stop_grace_period: 45s
+    # Longer than the default 10s because `worker.runner` handles SIGTERM to let
+    # an in-flight cycle finish. Killing it between submitting an entry and
+    # resting its profit target is precisely the state §2.6 calls a
+    # reconciliation defect.
+
+volumes:
+  pgdata:

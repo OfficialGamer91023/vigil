@@ -1,5 +1,6 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker cycle flatten cli db migrate lock clean
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker cycle flatten cli db migrate lock \
+	up down logs ps build stack-migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -59,6 +60,38 @@ worker:
 #   make cycle C=premarket | open | manage | entry | flatten | postclose
 cycle:
 	$(RUN) python -m vigil.worker.sessions $(C)
+
+# --- Docker Compose (PLAN §9) ------------------------------------------------
+# postgres + redis + migrate + worker. `api` joins on Day 3.
+#
+# The compose Postgres publishes on **5433**, not 5432, so it coexists with a
+# local Postgres rather than fighting it for the port. Host tooling that should
+# talk to the *containerised* database needs:
+#   DATABASE_URL=postgresql+asyncpg://vigil:vigil@localhost:5433/vigil
+COMPOSE = docker compose
+
+build:
+	$(COMPOSE) build
+
+# Brings up the stack. `migrate` runs to completion first (compose waits on
+# service_completed_successfully), so the worker never races a half-applied schema.
+up:
+	$(COMPOSE) up -d
+	@$(COMPOSE) ps
+
+down:
+	$(COMPOSE) down
+
+logs:
+	$(COMPOSE) logs -f
+
+ps:
+	$(COMPOSE) ps
+
+# Migrations against the containerised database, run inside the image so the
+# alembic version matches the one the worker imports.
+stack-migrate:
+	$(COMPOSE) run --rm migrate
 
 # --- Journal (PLAN §3) ------------------------------------------------------
 # Creates the database if it is missing. Migrations never run create_all()

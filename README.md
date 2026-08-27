@@ -89,7 +89,8 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `api/` — FastAPI read + control routes, SSE | ⬜ |
 | Redis chain cache · arq LLM queue | ⬜ |
 | `journal/` — daily report, social draft | ⬜ |
-| Docker Compose · CI | ⬜ |
+| Docker Compose (`postgres` · `redis` · `migrate` · `worker`) | ✅ (unbuilt — see below) |
+| CI | ⬜ |
 
 Tests: 285 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
 
@@ -111,7 +112,23 @@ make worker               # the agent — in-process scheduler, no Redis, no API
 make cycle C=manage       # one cycle by hand: premarket|open|manage|entry|flatten|postclose
 
 make flatten              # emergency: guarded cancel-all + close-all
+
+make build                # build the image
+make up                   # postgres + redis + migrate + worker, detached
+make logs                 # tail the stack
+make down                 # stop it
 ```
+
+The compose Postgres publishes on **5433**, not 5432, so it coexists with a local
+Postgres instead of fighting it for the port. `worker` deliberately does **not**
+`depends_on` redis — hard rule #6 says the agent runs with Redis stopped, and
+`docker compose stop redis` is that claim being demonstrable rather than asserted.
+
+> The Compose stack has **not been built or run** — there is no Docker on the
+> machine it was written on. The Dockerfile's dependency set was verified by
+> installing `--frozen --no-dev` into a throwaway venv and starting the worker
+> from it, and the YAML and every `COPY` path were checked statically, but
+> `docker compose up` itself is unrun. Treat the first `make up` as a real test.
 
 Until `config/account.lock` exists every cycle refuses to start, naming the account
 the current `.env` actually resolves to. That is hard rule #7 working, not a setup bug.
