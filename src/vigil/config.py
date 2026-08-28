@@ -167,6 +167,25 @@ class RegimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GreeksConfig:
+    """Inputs to the local Black-Scholes fallback (§1.3 A1). See data/greeks.py.
+
+    `risk_free_rate` is a plain `float`, not a `Decimal`, and that is deliberate.
+    Decimal exists in this codebase to keep binary floating point away from money.
+    This number is not money: it goes straight into `exp()` and `log()`, which are
+    float operations, so a Decimal here would only be converted back and would
+    imply a precision guarantee the model does not have.
+    """
+
+    risk_free_rate: float
+
+    @classmethod
+    def load(cls) -> GreeksConfig:
+        g = _load("strategy.yaml")["greeks"]
+        return cls(risk_free_rate=float(g["risk_free_rate"]))
+
+
+@dataclass(frozen=True, slots=True)
 class UniverseConfig:
     primary: tuple[str, ...]
     secondary: tuple[str, ...]
@@ -196,3 +215,4 @@ risk_config = lru_cache(maxsize=1)(RiskConfig.load)
 strategy_config = lru_cache(maxsize=1)(StrategyConfig.load)
 universe_config = lru_cache(maxsize=1)(UniverseConfig.load)
 regime_config = lru_cache(maxsize=1)(RegimeConfig.load)
+greeks_config = lru_cache(maxsize=1)(GreeksConfig.load)

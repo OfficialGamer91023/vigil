@@ -8,8 +8,8 @@ bounded by an ATM strike window and an explicit expiry range.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import date, timedelta
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from alpaca.data.enums import DataFeed
@@ -23,12 +23,14 @@ from alpaca.trading.enums import ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
 
 from vigil.clock import is_expiry_live, today_et
+from vigil.config import greeks_config
 from vigil.data.alpaca_client import (
     OPTIONS_FEED,
     option_data_client,
     stock_data_client,
     trading_client,
 )
+from vigil.data.greeks import ModelGreeks, solve
 from vigil.data.occ import OccSymbol, parse_occ
 
 # Free tier serves IEX for stocks. Named once, for the same reason as OPTIONS_FEED.
@@ -45,6 +47,9 @@ class Contract:
 
     occ: OccSymbol
     snapshot: OptionsSnapshot
+    # Locally modelled greeks, attached by `fetch_chain` only when the feed did
+    # not supply them. See `data/greeks.py` and PLAN §1.3 (assumption A1).
+    computed: ModelGreeks | None = None
 
     @property
     def bid(self) -> Decimal | None:
@@ -74,12 +79,35 @@ class Contract:
 
     @property
     def delta(self) -> float | None:
+        """Feed delta if the feed has one, else the locally modelled delta.
+
+        A1 measured 28 Aug 2026: the free indicative feed has none, so in practice
+        this is always the modelled value today. The feed branch stays first so
+        that an OPRA entitlement would restore real greeks with no code change and
+        no flag to flip.
+        """
         g = self.snapshot.greeks
-        return None if g is None else g.delta
+        if g is not None:
+            return g.delta
+        return None if self.computed is None else self.computed.delta
 
     @property
     def iv(self) -> float | None:
-        return self.snapshot.implied_volatility
+        """Same precedence as `delta`. Feeds the IV percentile and VRP (§4.3.1)."""
+        quoted = self.snapshot.implied_volatility
+        if quoted is not None:
+            return quoted
+        return None if self.computed is None else self.computed.iv
+
+    @property
+    def greeks_are_modelled(self) -> bool:
+        """Did `delta`/`iv` come from our model rather than the feed?
+
+        Worth carrying explicitly: when a Gate 7 verdict is reviewed after the
+        fact, "was that a quoted delta or one we inferred?" is the first question,
+        and a journal that cannot answer it is guessing.
+        """
+        return self.snapshot.greeks is None and self.computed is not None
 
 
 def spot_price(underlying: str) -> Decimal:
@@ -89,6 +117,39 @@ def spot_price(underlying: str) -> Decimal:
     return Decimal(str(trade.price))
 
 
+def _with_greeks(
+    contract: Contract, *, spot: Decimal, now: datetime | None, rate: float
+) -> Contract:
+    """Attach modelled greeks to a contract whose feed snapshot has none (§1.3 A1).
+
+    Returns the contract unchanged when the feed already supplied greeks, so this
+    is a pure fallback rather than an override.
+
+    A contract with no two-sided quote is also returned unchanged — deliberately.
+    The obvious patch is to invert the last *trade* instead, but on the indicative
+    feed trades are delayed 15 minutes, and a delta computed from a 15-minute-old
+    price during a fast move is worse than no delta at all: `pick_by_delta` skips a
+    missing one, while a stale one gets selected on and sized against.
+    """
+    if contract.snapshot.greeks is not None and contract.snapshot.implied_volatility is not None:
+        return contract
+
+    mid = contract.mid
+    if mid is None:
+        return contract
+
+    model = solve(
+        price=float(mid),
+        spot=float(spot),
+        strike=float(contract.occ.strike),
+        expiry=contract.occ.expiry,
+        rate=rate,
+        is_put=contract.occ.is_put,
+        now=now,
+    )
+    return contract if model is None else replace(contract, computed=model)
+
+
 def fetch_chain(
     underlying: str,
     *,
@@ -96,6 +157,7 @@ def fetch_chain(
     max_dte: int = 2,
     strike_window: Decimal = Decimal(12),
     asof: date | None = None,
+    now: datetime | None = None,
     contract_type: ContractType | None = None,
 ) -> list[Contract]:
     """Snapshots for `underlying` within `max_dte` days and +/- `strike_window` of spot.
@@ -118,6 +180,7 @@ def fetch_chain(
     )
 
     snapshots = option_data_client().get_option_chain(req)
+    rate = greeks_config().risk_free_rate
 
     out: list[Contract] = []
     for symbol, snap in snapshots.items():
@@ -132,7 +195,7 @@ def fetch_chain(
         # its greeks come back null, which would look like a data-quality failure.
         if not is_expiry_live(occ.expiry):
             continue
-        out.append(Contract(occ=occ, snapshot=snap))
+        out.append(_with_greeks(Contract(occ=occ, snapshot=snap), spot=spot, now=now, rate=rate))
 
     # Sorted so downstream printing and strike-walking are deterministic.
     out.sort(key=lambda c: (c.occ.expiry, c.occ.is_put, c.occ.strike))

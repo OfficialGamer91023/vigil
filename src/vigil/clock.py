@@ -31,7 +31,7 @@ def today_et() -> date:
     return now_et().date()
 
 
-def _in_et(at: datetime | None) -> datetime:
+def to_et(at: datetime | None) -> datetime:
     """Coerce a caller's timestamp into US/Eastern, refusing naive input.
 
     `astimezone` on a *naive* datetime silently assumes the machine's local zone,
@@ -53,7 +53,7 @@ def is_market_open(at: datetime | None = None) -> bool:
     answer from Alpaca's clock/calendar endpoint. This is for labelling and local
     reasoning, and it says so rather than pretending to be a calendar.
     """
-    t = _in_et(at)
+    t = to_et(at)
     if t.weekday() >= 5:
         return False
     return MARKET_OPEN <= t.time() < MARKET_CLOSE
@@ -67,7 +67,7 @@ def is_expiry_live(expiry: date, at: datetime | None = None) -> bool:
     quoted with null greeks. Treating a dead expiry as a candidate is how a chain
     scan silently fills up with untradeable contracts.
     """
-    t = _in_et(at)
+    t = to_et(at)
     if expiry < t.date():
         return False
     # Same-day expiry stays live right up to the closing bell, then settles.
