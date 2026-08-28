@@ -24,6 +24,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
+from tests.conftest import truncate_journal
 from vigil.api.main import app
 from vigil.control import FLATTEN_FLAG, HALT_FLAG
 from vigil.db.repositories import journal as J
@@ -195,16 +196,12 @@ async def _postgres_reachable() -> bool:
 
 @pytest.fixture
 async def clean_db():
+    """Truncated before each test; the run's final rows are swept by
+    `pytest_sessionfinish` in conftest. See `truncate_journal` for why."""
     if not await _postgres_reachable():
         pytest.skip(f"no Postgres at {os.getenv('DATABASE_URL', 'localhost/vigil')}")
     async with get_session() as s:
-        await s.execute(
-            text(
-                "TRUNCATE accounts, sessions, cycles, proposals, proposal_legs, "
-                "gate_verdicts, structures, orders, fills, equity_snapshots, "
-                "market_snapshots, llm_memos, control_flags RESTART IDENTITY CASCADE"
-            )
-        )
+        await truncate_journal(s)
     yield
 
 
@@ -339,6 +336,90 @@ async def test_gate_stats_report_passes_as_well_as_failures(client, clean_db) ->
     A rejection tally alone cannot tell those two apart, so both counts ship.
     """
     assert (await client.get("/api/gates/stats")).json() == []
+
+
+@db
+async def test_market_reports_the_latest_read_per_underlying(client, clean_db) -> None:
+    """One row per symbol, and it must be the **newest** one.
+
+    This route exists because `cycles.regime` holds a single value that the entry
+    loop overwrites once per symbol, so it reports whichever underlying was
+    sensed last. `market_snapshots` is written per symbol per cycle, so it is the
+    only honest source for a multi-name dashboard. The assertion drives that: two
+    cycles of SPY plus one QQQ must come back as two rows, with SPY showing the
+    later spot.
+    """
+    async with get_session() as s:
+        account = await J.ensure_account(
+            s, alpaca_account_id="acct-market", starting_equity=Decimal(100000)
+        )
+        session_row = await J.open_session(
+            s, account_id=account.id, trading_date=datetime.now(UTC).date(),
+            opening_equity=Decimal(100000),
+        )
+        first = await J.start_cycle(s, session_id=session_row.id, kind="entry")
+        second = await J.start_cycle(s, session_id=session_row.id, kind="entry")
+        await J.record_market_snapshot(
+            s, cycle_id=first.id, underlying="SPY", spot=Decimal("700.00"),
+            iv_atm=Decimal("0.20"), rv_annual=Decimal("0.15"),
+            vrp_pct=Decimal("0.55"), iv_pct=Decimal("0.40"), trend=Decimal("0.004"),
+        )
+        await J.record_market_snapshot(
+            s, cycle_id=second.id, underlying="SPY", spot=Decimal("770.83"),
+            iv_atm=Decimal("0.21"), rv_annual=None,
+            vrp_pct=None, iv_pct=None, trend=Decimal("0.0039"),
+        )
+        await J.record_market_snapshot(
+            s, cycle_id=second.id, underlying="QQQ", spot=Decimal("719.84"),
+            iv_atm=Decimal("0.24"), rv_annual=Decimal("0.19"),
+            vrp_pct=Decimal("0.08"), iv_pct=Decimal("0.30"), trend=Decimal("-0.001"),
+        )
+
+    body = (await client.get("/api/market")).json()
+    assert [r["underlying"] for r in body] == ["QQQ", "SPY"]
+    spy = next(r for r in body if r["underlying"] == "SPY")
+    assert Decimal(str(spy["spot"])) == Decimal("770.83"), "returned the stale cycle"
+    # An unmeasurable realized vol must survive as null, not as 0.0 — the page
+    # renders a dash for it, and a zero would read as the calmest possible tape.
+    assert spy["rv_annual"] is None
+    assert spy["vrp_pct"] is None
+
+
+@db
+async def test_market_is_empty_before_the_first_read(client, clean_db) -> None:
+    assert (await client.get("/api/market")).json() == []
+
+
+@db
+async def test_orders_report_every_intent_newest_first(client, clean_db) -> None:
+    """Entries, resting targets and closes share one table, split by `intent`.
+
+    The §2.6 guarantee is "every open structure has a live resting exit", and the
+    only way to see that from the journal is to see the `target` ticket beside
+    the `open` one that created it.
+    """
+    async with get_session() as s:
+        await J.record_order(
+            s, client_order_id="vigil-vert-aaa-r1", broker_order_id="b1",
+            intent="open", limit_price=Decimal("0.22"), qty=3, status="filled", rung=1,
+        )
+        await J.record_order(
+            s, client_order_id="vigil-vert-aaa-tgt", broker_order_id="b2",
+            intent="target", limit_price=Decimal("0.11"), qty=3, status="new",
+        )
+
+    body = (await client.get("/api/orders")).json()
+    assert {o["intent"] for o in body} == {"open", "target"}
+    assert body[0]["client_order_id"] == "vigil-vert-aaa-tgt", "not newest-first"
+    entry = next(o for o in body if o["intent"] == "open")
+    assert entry["rung"] == 1
+    # Limits are money, so they must not have gone through a float on the wire.
+    assert Decimal(str(entry["limit_price"])) == Decimal("0.22")
+
+
+@db
+async def test_orders_are_empty_before_the_first_ticket(client, clean_db) -> None:
+    assert (await client.get("/api/orders")).json() == []
 
 
 def test_the_desk_pages_javascript_parses() -> None:

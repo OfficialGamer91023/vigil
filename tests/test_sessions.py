@@ -17,6 +17,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select, text
 
+from tests.conftest import truncate_journal
 from vigil.db.models import Cycle, OpenStructureRow
 from vigil.db.models import Order as OrderRow
 from vigil.db.repositories import journal as J
@@ -61,15 +62,14 @@ async def _require_postgres():
 
 @pytest.fixture(autouse=True)
 async def _clean_journal():
-    """Truncate between tests. These assert on counts, so leftovers would lie."""
+    """Truncate before every test. These assert on counts, so leftovers would lie.
+
+    The *last* test's rows are cleaned by `pytest_sessionfinish` in conftest
+    rather than here — a per-test teardown has to run after the engine-disposal
+    fixture and lands on a closed event loop.
+    """
     async with get_session() as s:
-        await s.execute(
-            text(
-                "TRUNCATE accounts, sessions, cycles, proposals, proposal_legs, "
-                "gate_verdicts, structures, orders, fills, equity_snapshots, "
-                "market_snapshots, llm_memos, control_flags RESTART IDENTITY CASCADE"
-            )
-        )
+        await truncate_journal(s)
     yield
 
 
@@ -349,6 +349,105 @@ async def test_an_incomplete_flatten_is_loud(no_lock):
         result = S.CycleResult(kind=CycleKind.FLATTEN)
         await S.flatten(ctx, result)
     assert any("FLATTEN INCOMPLETE" in w for w in result.warnings)
+
+
+async def test_a_requested_flatten_closes_later_expiries_too(no_lock):
+    """`/api/control/flatten` says close-all; the 15:40 stop says close-expiring.
+
+    The scheduled run deliberately leaves a Monday expiry alone — auto-exercise is
+    what it exists to prevent, and a later expiry is a position we still want. An
+    operator asking for a flatten is asking for something else entirely, and a
+    flatten that left half the book on would be the more dangerous reading.
+    """
+    structure = make_structure(expiry=date.today() + timedelta(days=2))
+    broker = StubBroker(
+        structures=(structure,),
+        quotes={
+            structure.legs[0].symbol: (Decimal("0.10"), Decimal("0.12")),
+            structure.legs[1].symbol: (Decimal("0.04"), Decimal("0.06")),
+        },
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.FLATTEN, flatten_requested=True)
+        await S.flatten(ctx, result)
+
+    assert len(broker.closes) == 1, "a requested flatten must take the whole book"
+    assert "operator flatten requested" in broker.closes[0][2]
+
+
+async def test_a_requested_flatten_keeps_the_flag_until_the_book_is_empty(no_lock):
+    """Closes are limit orders, not fills — so this cycle cannot claim success.
+
+    Hard rule #5 forbids the market order that would make a close immediate, so
+    the honest state after submitting is "asked, not confirmed". Clearing the flag
+    here would resume trading on the strength of an order that may never fill.
+    """
+    structure = make_structure(expiry=date.today())
+    broker = StubBroker(
+        structures=(structure,),
+        quotes={
+            structure.legs[0].symbol: (Decimal("0.10"), Decimal("0.12")),
+            structure.legs[1].symbol: (Decimal("0.04"), Decimal("0.06")),
+        },
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await J.set_flag(db, S.FLATTEN_FLAG, active=True, set_by="test")
+        result = S.CycleResult(kind=CycleKind.FLATTEN, flatten_requested=True)
+        await S.flatten(ctx, result)
+        assert await J.is_flag_active(db, S.FLATTEN_FLAG) is True
+    assert "stays set until" in result.summary
+
+
+async def test_a_requested_flatten_clears_the_flag_once_the_book_is_flat(no_lock):
+    """The bug this exists for: the flag was never cleared by anything.
+
+    Left set, it pre-empted **every** subsequent cycle — so a single mis-click on
+    `/api/control/flatten` ended trading for the rest of the competition until a
+    human remembered `/unflatten`. The next cycle after the closes fill has to
+    reconcile against an empty broker and stand the agent back up on its own.
+    """
+    broker = StubBroker(structures=())          # the closes filled; nothing left
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await J.set_flag(db, S.FLATTEN_FLAG, active=True, set_by="test")
+        result = S.CycleResult(kind=CycleKind.FLATTEN, flatten_requested=True)
+        await S.flatten(ctx, result)
+        assert await J.is_flag_active(db, S.FLATTEN_FLAG) is False
+    assert "entries resume next cycle" in result.summary
+
+
+async def test_the_scheduled_flatten_never_touches_the_flag(no_lock):
+    """15:40 is the clock, not an operator. It has no business clearing a request.
+
+    If someone sets FLATTEN at 15:39, the scheduled run must not be the thing that
+    decides the request was satisfied — otherwise a daily stop would silently
+    withdraw a human's instruction.
+    """
+    broker = StubBroker(structures=())
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await J.set_flag(db, S.FLATTEN_FLAG, active=True, set_by="test")
+        result = S.CycleResult(kind=CycleKind.FLATTEN)   # flatten_requested stays False
+        await S.flatten(ctx, result)
+        assert await J.is_flag_active(db, S.FLATTEN_FLAG) is True
+
+
+async def test_a_flatten_request_stands_the_agent_back_up_end_to_end(no_lock):
+    """Two real cycles: the request pre-empts, then the agent resumes by itself."""
+    async with get_session() as db:
+        await J.set_flag(db, S.FLATTEN_FLAG, active=True, set_by="test")
+
+    # Cycle one: an ENTRY was due, the flag pre-empts it, the book is already flat.
+    first = await S.run_cycle(CycleKind.ENTRY, broker=StubBroker(structures=()))
+    assert first.kind is CycleKind.FLATTEN
+    assert first.flatten_requested is True
+
+    # Cycle two: the flag is gone, so the cycle that was asked for actually runs.
+    second = await S.run_cycle(CycleKind.MANAGE, broker=StubBroker(structures=()))
+    assert second.kind is CycleKind.MANAGE, "the flag was never cleared"
+    assert second.flatten_requested is False
 
 
 # --------------------------------------------------------------------------- #

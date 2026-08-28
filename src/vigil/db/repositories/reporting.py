@@ -28,7 +28,9 @@ from vigil.db.models import (
     Cycle,
     EquitySnapshot,
     GateVerdictRow,
+    MarketSnapshotRow,
     OpenStructureRow,
+    Order,
     Proposal,
     Session,
 )
@@ -175,3 +177,43 @@ async def open_risk(session: AsyncSession) -> Decimal:
         )
     )
     return Decimal(str(total or 0))
+
+
+async def latest_market_snapshots(session: AsyncSession) -> list[MarketSnapshotRow]:
+    """The most recent market read **per underlying** — what the router last saw.
+
+    `DISTINCT ON` is Postgres-specific and is the reason this is one query rather
+    than a window-function subquery: it keeps the first row of each `underlying`
+    group after the `ORDER BY`, so ordering by `cycle_id DESC` inside the group
+    yields the newest snapshot for each symbol directly. The leading `ORDER BY`
+    columns must match the `DISTINCT ON` columns, which is why `underlying` is
+    ordered first and the result is re-sorted for display afterwards.
+
+    **Per underlying, deliberately.** `cycles.regime` holds a single value that
+    the entry loop overwrites once per symbol, so it reports whichever underlying
+    happened to be sensed last. This table is written once per symbol per cycle,
+    so it is the only place the dashboard can honestly show SPY and QQQ as the
+    separate reads they are.
+    """
+    rows = await session.scalars(
+        select(MarketSnapshotRow)
+        .distinct(MarketSnapshotRow.underlying)
+        .order_by(MarketSnapshotRow.underlying, MarketSnapshotRow.cycle_id.desc())
+    )
+    return sorted(rows.all(), key=lambda r: r.underlying)
+
+
+async def recent_orders(session: AsyncSession, *, limit: int = 50) -> list[Order]:
+    """Every ticket the router sent, newest first.
+
+    Entries, resting profit targets and closes all land here, distinguished by
+    `intent` — so "did the §2.6 target actually get placed?" is answerable from
+    the same table that records the entry it belongs to.
+    """
+    return list(
+        (
+            await session.scalars(
+                select(Order).order_by(Order.submitted_at.desc(), Order.id.desc()).limit(limit)
+            )
+        ).all()
+    )

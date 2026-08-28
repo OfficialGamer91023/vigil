@@ -241,3 +241,88 @@ def long_strangle() -> TradeProposal:
         client_order_id="vigil-test-strg-0001",
         limit_price=Decimal("1.64"),   # both mids
     )
+
+
+# --------------------------------------------------------------------------- #
+# The journal, between database-backed tests
+# --------------------------------------------------------------------------- #
+
+async def truncate_journal(session: object) -> None:
+    """Empty every journal table. Run before each database-backed test.
+
+    **The table list is derived from the mapped metadata, not hand-written.** It
+    was spelled out as a literal in two separate files, so adding a table to
+    `db/models.py` meant remembering to add it to two `TRUNCATE` strings that
+    nothing checks — and a table missing from the list is one that silently
+    accumulates rows across the whole suite. `sorted_tables` cannot fall behind
+    the models, because it *is* the models.
+
+    `alembic_version` is excluded deliberately: it is schema state, not journal
+    state, and truncating it would make the next `alembic upgrade` try to replay
+    a migration that has already run.
+    """
+    from sqlalchemy import text
+
+    from vigil.db.models import Base
+
+    names = ", ".join(
+        t.name for t in Base.metadata.sorted_tables if t.name != "alembic_version"
+    )
+    await session.execute(  # type: ignore[attr-defined]
+        text(f"TRUNCATE {names} RESTART IDENTITY CASCADE")
+    )
+
+
+def pytest_sessionfinish(session: object, exitstatus: object) -> None:
+    """Leave the journal empty when the run ends.
+
+    **Why this is a session hook and not a fixture teardown.** The per-test
+    fixtures truncate on the way *in*, which is all test isolation needs — but it
+    leaves the final test's rows sitting in the database after pytest exits. On a
+    developer machine that database is also the one `make api` serves the desk
+    page from, so a finished test run left the dashboard reporting a fake
+    `acct-test` account at $110,000.
+
+    That is worse than a cosmetic wrong number. `reporting.the_account()` takes
+    the **lowest** account id on the assumption that hard rule #7 means there is
+    exactly one; a leftover test account is created first, so once the real
+    worker writes its own row the leftover shadows it permanently and the real
+    account never appears on the page again.
+
+    A fixture teardown cannot do this job: it would run after the engine-disposal
+    fixture has already closed the pool, and opening a session then raises
+    "attached to a different loop". A brand-new engine on a brand-new loop, once,
+    after every test has finished, has no such ordering to lose.
+
+    Failures here are swallowed on purpose. There may be no Postgres at all — the
+    database tests skip in that case — and a cleanup problem must never turn a
+    green run red.
+    """
+    import asyncio
+    import contextlib
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from vigil.db.models import Base
+    from vigil.db.session import database_url
+    from vigil.db.session import engine as cached_engine
+    from vigil.db.session import session_factory as cached_factory
+
+    cached_engine.cache_clear()
+    cached_factory.cache_clear()
+
+    names = ", ".join(
+        t.name for t in Base.metadata.sorted_tables if t.name != "alembic_version"
+    )
+
+    async def _wipe() -> None:
+        eng = create_async_engine(database_url())
+        try:
+            async with eng.begin() as conn:
+                await conn.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+        finally:
+            await eng.dispose()
+
+    with contextlib.suppress(Exception):
+        asyncio.run(_wipe())

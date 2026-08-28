@@ -24,6 +24,8 @@ from vigil.api.schemas import (
     EquityPoint,
     GateStat,
     Health,
+    MarketSnapshotOut,
+    OrderOut,
     StateOut,
     StructureOut,
 )
@@ -136,6 +138,23 @@ async def gates(db: Db) -> list[GateStat]:
         GateStat(gate_no=no, name=name, passed=ok, failed=bad)
         for no, name, ok, bad in await R.gate_stats(db)
     ]
+
+
+@router.get("/api/market", response_model=list[MarketSnapshotOut], tags=["read"])
+async def market(db: Db) -> list[MarketSnapshotOut]:
+    """The router's last read of each underlying — spot, trend, IV, RV, VRP.
+
+    The signal side of the story. `/api/cycles` says what the agent *decided*;
+    this says what it decided *from*, per symbol, which the single `regime`
+    column on a cycle cannot express when the universe holds more than one name.
+    """
+    return [MarketSnapshotOut.model_validate(m) for m in await R.latest_market_snapshots(db)]
+
+
+@router.get("/api/orders", response_model=list[OrderOut], tags=["read"])
+async def orders(db: Db, limit: int = Query(default=50, ge=1, le=500)) -> list[OrderOut]:
+    """Entries, resting targets and closes, newest first."""
+    return [OrderOut.model_validate(o) for o in await R.recent_orders(db, limit=limit)]
 
 
 @router.get("/api/control/flags", response_model=list[ControlFlagOut], tags=["read"])

@@ -81,6 +81,11 @@ class CycleResult:
     cycle_id: int | None = None
     regime: str | None = None
     cold_start: bool = False
+    # True when this cycle is running because an operator set the FLATTEN flag,
+    # rather than because 15:40 came round. The two want different things: the
+    # scheduled stop closes what auto-exercise would otherwise take, while
+    # `/api/control/flatten` documents itself as "cancel-all + close-all".
+    flatten_requested: bool = False
     notes: list[str] = field(default_factory=list)
     proposals: int = 0
     approved: int = 0
@@ -574,27 +579,59 @@ async def flatten(ctx: RunnerContext, result: CycleResult) -> None:
     `submit_close` is deliberately not kernel-gated — routing this through Gate 11
     would produce a flatten that refuses to flatten in the last twenty minutes,
     which is the only time it ever runs.
+
+    **Two callers, two scopes.** The scheduled 15:40 run closes only what expires
+    today, because auto-exercise is the thing it exists to prevent and a later
+    expiry is a position we still want. An operator hitting
+    `/api/control/flatten` is asking for something else — that route documents
+    itself as "cancel-all + close-all" — so a requested flatten takes the whole
+    book. Conflating the two would either leave an operator's flatten half done
+    or make the daily stop liquidate positions it had no reason to touch.
     """
     await ctx.broker.cancel_all_orders()
     result.note("cancelled all working orders")
 
     structures = await reconcile(ctx, result)
-    expiring = [s for s in structures if s.expiry <= ctx.trading_date]
-    if not expiring:
-        result.note("nothing expiring today; book left as is")
-        return
 
-    for s in expiring:
-        decision = ManagementDecision(
-            s, Action.CLOSE_TIME_STOP,
-            f"15:40 hard flatten — expires {s.expiry}, auto-exercise is not a strategy",
+    if result.flatten_requested:
+        # The flag is only ever cleared here, and only on a cycle that *arrived*
+        # to an empty book. `_close_structure` submits a limit order, not a fill
+        # (hard rule #5 forbids the market order that would make it one), so a
+        # cycle that has just sent closes cannot honestly claim the book is flat.
+        # Leaving the flag set means the next cycle re-runs this one, sees the
+        # fills, and clears it then — which is also the behaviour that keeps a
+        # flatten whose closes never filled from silently resuming trading.
+        if not structures:
+            await J.set_flag(
+                ctx.db, FLATTEN_FLAG, active=False, set_by="worker",
+                reason="book confirmed flat; requested flatten complete",
+            )
+            result.note("book confirmed flat — FLATTEN cleared, entries resume next cycle")
+            return
+        targets = list(structures)
+        why = "operator flatten requested via /api/control/flatten"
+    else:
+        targets = [s for s in structures if s.expiry <= ctx.trading_date]
+        if not targets:
+            result.note("nothing expiring today; book left as is")
+            return
+        why = ""
+
+    for s in targets:
+        reason = why or (
+            f"15:40 hard flatten — expires {s.expiry}, auto-exercise is not a strategy"
         )
-        await _close_structure(ctx, decision, result)
+        await _close_structure(ctx, ManagementDecision(s, Action.CLOSE_TIME_STOP, reason), result)
 
-    if result.closed < len(expiring):
+    if result.closed < len(targets):
         result.warnings.append(
-            f"FLATTEN INCOMPLETE: {len(expiring) - result.closed} of {len(expiring)} "
-            f"expiring structure(s) still open. Run `make flatten`."
+            f"FLATTEN INCOMPLETE: {len(targets) - result.closed} of {len(targets)} "
+            f"structure(s) still open. Run `make flatten`."
+        )
+    elif result.flatten_requested:
+        result.note(
+            f"closes submitted for {len(targets)} structure(s); FLATTEN stays set until "
+            f"a later cycle confirms the book is empty"
         )
 
 
@@ -677,7 +714,11 @@ async def run_cycle(kind: CycleKind, *, broker: Broker | None = None) -> CycleRe
     # ---- transaction one: identity, committed before any work happens ------ #
     async with get_session() as db:
         ctx = await open_context(b, db)
-        if await J.is_flag_active(db, FLATTEN_FLAG) and kind is not CycleKind.FLATTEN:
+        # Read once and carry it: `flatten()` needs to know whether it is serving
+        # an operator or the clock, and it is also the only cycle allowed to clear
+        # the flag again.
+        result.flatten_requested = await J.is_flag_active(db, FLATTEN_FLAG)
+        if result.flatten_requested and kind is not CycleKind.FLATTEN:
             result.note("FLATTEN flag active — running the flatten cycle instead")
             kind, result.kind = CycleKind.FLATTEN, CycleKind.FLATTEN
         cycle_row = await J.start_cycle(db, session_id=ctx.session_row_id, kind=kind.value)

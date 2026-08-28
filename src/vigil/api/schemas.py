@@ -136,6 +136,49 @@ class CycleDetailOut(CycleOut):
     proposals: list[ProposalOut] = []
 
 
+class MarketSnapshotOut(BaseModel):
+    """One underlying as the router last saw it (`/api/market`).
+
+    Every field after `spot` is nullable and that is meaningful, not sloppy:
+    `rv_annual` is `None` when realized vol was unmeasurable, `vrp_pct` is `None`
+    when there was no distribution to rank against, and `iv_atm` is `None` when
+    the indicative feed served no greeks. The page renders a dash for each, so a
+    missing measurement reads as missing rather than as zero — which is the exact
+    confusion `MarketSnapshot.rv_annual` exists to prevent upstream.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    underlying: str
+    spot: Decimal
+    iv_atm: Decimal | None
+    rv_annual: Decimal | None
+    vrp_pct: Decimal | None
+    iv_pct: Decimal | None
+    trend: Decimal | None
+    cycle_id: int
+
+
+class OrderOut(BaseModel):
+    """One ticket sent to the broker (`/api/orders`).
+
+    `intent` is `open` / `close` / `target`, and `rung` is the price-ladder step
+    an entry filled on — both are what make the execution story legible on the
+    page rather than a flat list of limit prices.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    client_order_id: str
+    intent: str
+    limit_price: Decimal
+    qty: int
+    status: str
+    rung: int | None
+    submitted_at: datetime
+
+
 class GateStat(BaseModel):
     gate_no: int
     name: str

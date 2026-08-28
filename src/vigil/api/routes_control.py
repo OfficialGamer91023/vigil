@@ -67,7 +67,15 @@ async def flatten(db: Db, reason: str | None = Body(default=None, embed=True)) -
     Pre-empts whatever cycle was due rather than queueing behind it. The flag is
     left active afterwards on purpose: clearing it here would be this service
     asserting an outcome it cannot observe, and a flatten that half-completed
-    would look finished. The worker clears it once the book is actually flat.
+    would look finished.
+
+    **The worker clears it, and only once it has seen an empty book.** Closes go
+    out as limit orders (hard rule #5), so the cycle that submits them cannot
+    confirm they filled; the flag survives until a later cycle reconciles against
+    the broker and finds nothing left. That means a flatten whose closes never
+    filled keeps pre-empting rather than quietly letting the agent trade again —
+    and it means normal operation resumes on its own, without anyone having to
+    remember to call `/unflatten`.
     """
     await J.set_flag(db, FLATTEN_FLAG, active=True, set_by="api", reason=reason)
     return ControlResult(

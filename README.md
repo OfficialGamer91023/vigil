@@ -124,8 +124,14 @@ The API serves the desk page at `/`, OpenAPI docs at `/docs`, and:
 
 | Route | Auth |
 |---|---|
-| `GET /health` · `/api/state` · `/api/equity` · `/api/cycles[/{id}]` · `/api/gates/stats` · `/api/stream` | public |
+| `GET /health` · `/api/state` · `/api/equity` · `/api/cycles[/{id}]` · `/api/gates/stats` · `/api/market` · `/api/orders` · `/api/stream` | public |
 | `POST /api/control/{halt,unhalt,flatten,unflatten}` | **bearer** |
+
+The desk page renders equity and its curve, open risk against the 12% book
+ceiling, the per-underlying market read, the book, gate pass rates, the order
+log, and a decision feed where **clicking a cycle expands every proposal it
+considered with all twelve verdicts and the reason each rejection gave**. It
+updates on the SSE stream, with a 30-second poll behind it.
 
 ```bash
 curl -XPOST -H "Authorization: Bearer $API_CONTROL_TOKEN" localhost:8000/api/control/halt
