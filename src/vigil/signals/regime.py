@@ -236,15 +236,22 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
             Regime.CHOP, Structure.IRON_CONDOR,
             "insufficient history for a trend read — defaulting to direction-agnostic")
 
+    # Trend regimes route to the broken-wing condor, not a lone vertical (B-1,
+    # §4.4.2). A single credit spread's credit/width is pinned below its short
+    # delta, so it can never clear Gate 9's 18% floor at 0–2 DTE — the router
+    # would build a structure the kernel always rejects. The condor collects two
+    # credits to clear the floor and skews its short strikes toward the trend to
+    # keep the directional lean. The plain verticals stay in the enum as
+    # exceptions the PM agent may still pick; they are no longer the default.
     t = Decimal(str(trend))
     if t > c.trend_threshold:
         return verdict(
-            Regime.TREND_UP, Structure.PUT_CREDIT_SPREAD,
-            f"trend +{trend:.2%} above threshold — sell fear below the trend")
+            Regime.TREND_UP, Structure.BROKEN_WING_CONDOR,
+            f"trend +{trend:.2%} above threshold — put-skewed condor, lean long with the trend")
     if t < -c.trend_threshold:
         return verdict(
-            Regime.TREND_DOWN, Structure.CALL_CREDIT_SPREAD,
-            f"trend {trend:.2%} below threshold — sell greed above the trend")
+            Regime.TREND_DOWN, Structure.BROKEN_WING_CONDOR,
+            f"trend {trend:.2%} below threshold — call-skewed condor, lean short with the trend")
 
     return verdict(
         Regime.CHOP, Structure.IRON_CONDOR,

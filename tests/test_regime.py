@@ -32,14 +32,17 @@ def test_flat_tape_with_healthy_vrp_is_chop_and_wants_a_condor() -> None:
     assert v.structure is Structure.IRON_CONDOR
 
 
-def test_uptrend_sells_puts_and_downtrend_sells_calls() -> None:
+def test_trend_regimes_route_to_a_broken_wing_condor() -> None:
+    """B-1: a lone vertical's credit/width can never clear Gate 9's 18% floor at
+    0–2 DTE, so trend regimes route to the delta-skewed condor instead — two
+    credits to clear the floor, short strikes tilted toward the trend."""
     up = classify(snap(daily_closes=[700.0 + i for i in range(40)]))
     assert up.regime is Regime.TREND_UP
-    assert up.structure is Structure.PUT_CREDIT_SPREAD
+    assert up.structure is Structure.BROKEN_WING_CONDOR
 
     down = classify(snap(daily_closes=[700.0 - i for i in range(40)]))
     assert down.regime is Regime.TREND_DOWN
-    assert down.structure is Structure.CALL_CREDIT_SPREAD
+    assert down.structure is Structure.BROKEN_WING_CONDOR
 
 
 def test_a_large_overnight_gap_stands_us_down_entirely() -> None:

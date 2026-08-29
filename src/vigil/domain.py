@@ -26,6 +26,13 @@ class Structure(StrEnum):
     PUT_CREDIT_SPREAD = "put_credit_spread"
     CALL_CREDIT_SPREAD = "call_credit_spread"
     IRON_CONDOR = "iron_condor"
+    # A condor with equal, narrow wings but short strikes at *different* deltas,
+    # so the package carries a directional lean toward the trend while still
+    # collecting two credits. It exists to resolve B-1: a single vertical's
+    # credit/width is pinned below its short delta (credit/width ≈ N(−d₂) < |Δ|),
+    # so at 0.16 delta it cannot reach Gate 9's 18% floor — but two credits can.
+    # See strategy/candidates.build_broken_wing_condor and PLAN §4.4.2.
+    BROKEN_WING_CONDOR = "broken_wing_condor"
     DEBIT_SPREAD = "debit_spread"
     LONG_STRANGLE = "long_strangle"
 

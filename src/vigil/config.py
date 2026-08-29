@@ -101,6 +101,12 @@ class StrategyConfig:
     short_delta_target: Decimal
     short_delta_min: Decimal
     short_delta_max: Decimal
+    # Broken-wing (delta-skewed) condor, the trend structure (§4.4.2, B-1). The
+    # near leg is the trend-favorable short strike sold *closer* to the money for
+    # more credit and a directional delta tilt; the far leg is the opposite side
+    # sold further out. Two credits clear the 18% floor a lone vertical cannot.
+    skew_short_delta_near: Decimal
+    skew_short_delta_far: Decimal
     min_dte: int
     max_dte: int
     width_by_underlying: dict[str, Decimal]
@@ -126,6 +132,8 @@ class StrategyConfig:
             short_delta_target=_dec(s, "short_delta_target"),
             short_delta_min=_dec(s, "short_delta_min"),
             short_delta_max=_dec(s, "short_delta_max"),
+            skew_short_delta_near=_dec(s, "skew_short_delta_near"),
+            skew_short_delta_far=_dec(s, "skew_short_delta_far"),
             min_dte=int(s["min_dte"]),
             max_dte=int(s["max_dte"]),
             width_by_underlying={k: Decimal(str(v)) for k, v in s["width_by_underlying"].items()},

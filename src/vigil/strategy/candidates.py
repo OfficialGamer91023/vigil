@@ -74,21 +74,28 @@ def build_vertical(
     open_interest: dict[str, int] | None = None,
     regime: Regime | None = None,
     size_multiplier: Decimal = Decimal(1),
+    short_delta_target: Decimal | None = None,
     config: StrategyConfig | None = None,
 ) -> TradeProposal | None:
     """A credit spread: sell the ~0.16-delta strike, buy the next one out.
 
     Put spread for a bullish/neutral read, call spread for bearish — the geometry
     is a mirror image, so one function serves both via `is_put`.
+
+    `short_delta_target` overrides the configured 0.16 when a caller wants a
+    different strike — the broken-wing condor sells one side nearer and one side
+    further than the symmetric target. `None` keeps the single-vertical default,
+    so every existing caller is unaffected.
     """
     cfg = config or strategy_config()
     width = cfg.width_for(underlying)
+    target = cfg.short_delta_target if short_delta_target is None else short_delta_target
 
     side = [c for c in contracts if c.occ.is_put == is_put and c.occ.expiry == expiry]
     if not side:
         return None
 
-    short_c = pick_by_delta(side, target=cfg.short_delta_target)
+    short_c = pick_by_delta(side, target=target)
     if short_c is None or short_c.delta is None:
         return None
 
@@ -340,6 +347,120 @@ def build_iron_condor(
     )
 
 
+def build_broken_wing_condor(
+    contracts: Sequence[Contract],
+    *,
+    underlying: str,
+    spot: Decimal,
+    expiry: date,
+    trend: float,
+    risk_budget: Decimal,
+    remaining_delta_budget: Decimal,
+    open_interest: dict[str, int] | None = None,
+    regime: Regime | None = None,
+    size_multiplier: Decimal = Decimal(1),
+    config: StrategyConfig | None = None,
+) -> TradeProposal | None:
+    """A delta-skewed condor — the TREND structure that resolves B-1.
+
+    **The problem it exists for.** A vertical's conservative credit divided by its
+    width *is* the risk-neutral probability the short strike finishes in the money,
+    N(−d₂), and that number sits strictly below the short strike's |delta|. At the
+    0.16-delta target the ceiling is ~16%, so no vertical at 0–2 DTE can reach Gate
+    9's 18% credit floor — the router builds a structure the kernel then always
+    rejects. A condor collects **two** credits against **one** width, so credit/width
+    roughly doubles and clears the floor.
+
+    **Why not the symmetric `build_iron_condor` then?** Because a symmetric condor
+    is delta-neutral, and a trend read is a directional opinion. This builder keeps
+    both wings the *same narrow width* (so max loss stays one width and Gate 1's
+    derived-width check still sees a single value) but sells the trend-favorable
+    side **nearer** the money and the other side **further** out:
+
+    - `trend > 0` (bullish): sell the put near, the call far. A short put carries
+      +delta, so the package leans **long** — with the trend.
+    - `trend < 0` (bearish): sell the call near, the put far. A short call carries
+      −delta, so the package leans **short** — with the trend.
+
+    The tilt is milder than a full vertical (the far leg partly offsets the near
+    leg's delta), so Gate 7 binds less hard here than on a pure credit spread, and
+    sizing has more room. Not a classic "broken wing" (which moves a *long* strike
+    to cut risk, and *reduces* credit — the wrong direction for B-1); the wings are
+    even and the asymmetry is in the short deltas.
+    """
+    cfg = config or strategy_config()
+    width = cfg.width_for(underlying)
+
+    # Positive trend → the put is the near (trend-favorable) side. The near side
+    # gets the richer delta; the far side the thin one. Both sides are the same
+    # width, so the only asymmetry is which strikes are short.
+    bullish = trend > 0
+    put_delta = cfg.skew_short_delta_near if bullish else cfg.skew_short_delta_far
+    call_delta = cfg.skew_short_delta_far if bullish else cfg.skew_short_delta_near
+
+    # Each side is built as a *credit vertical* purely to reuse the strike-picking,
+    # leg-construction and net-credit arithmetic. Their own contract counts are
+    # discarded — the package is sized once, below, on the combined delta and one
+    # width. The delta budget is **deliberately not passed through** to the side
+    # builds: the near side at ~0.30 delta can exceed the whole Gate 7 budget on
+    # its own contract, which would bench it and return None — yet the *package*
+    # is far more delta-neutral because the far side offsets it. Sizing the sides
+    # against the real budget would reject a condor that comfortably fits it. So
+    # the sides are built delta-unconstrained (they only need to yield legs); the
+    # one true Gate 7 check is applied to the combined package below.
+    _UNCONSTRAINED = Decimal(10) ** 12
+    put_side = build_vertical(
+        contracts, underlying=underlying, spot=spot, expiry=expiry, is_put=True,
+        risk_budget=risk_budget, remaining_delta_budget=_UNCONSTRAINED,
+        open_interest=open_interest, short_delta_target=put_delta, config=cfg)
+    call_side = build_vertical(
+        contracts, underlying=underlying, spot=spot, expiry=expiry, is_put=False,
+        risk_budget=risk_budget, remaining_delta_budget=_UNCONSTRAINED,
+        open_interest=open_interest, short_delta_target=call_delta, config=cfg)
+    if put_side is None or call_side is None:
+        return None
+
+    legs = put_side.legs + call_side.legs
+    net_credit = put_side.net_credit + call_side.net_credit
+    mid_credit = put_side.limit_price + call_side.limit_price
+
+    delta_per_contract = sum(
+        (Decimal(str(leg.delta)) * leg.signed_ratio * CONTRACT_MULTIPLIER * spot for leg in legs),
+        Decimal(0),
+    )
+    n = size_position(
+        width=width,
+        net_credit=net_credit,
+        risk_budget=risk_budget,
+        delta_per_contract=delta_per_contract,
+        remaining_delta_budget=remaining_delta_budget,
+        size_multiplier=size_multiplier,
+    )
+    if n < 1:
+        return None
+
+    near, far = ("put", "call") if bullish else ("call", "put")
+    return TradeProposal(
+        structure=Structure.BROKEN_WING_CONDOR,
+        underlying=underlying,
+        spot=spot,
+        expiry=expiry,
+        legs=legs,
+        contracts=n,
+        net_credit=net_credit,
+        width=width,
+        client_order_id=_client_order_id("bwc"),
+        limit_price=mid_credit,
+        regime=regime,
+        rationale=(
+            f"broken_wing_condor x{n}, total credit {net_credit} "
+            f"({net_credit / width:.1%} of one width), near={near} far={far}, "
+            f"short strikes {put_side.legs[0].occ.strike}P / {call_side.legs[0].occ.strike}C, "
+            f"net delta {float(delta_per_contract / (CONTRACT_MULTIPLIER * spot)):+.3f}"
+        ),
+    )
+
+
 def build_long_strangle(
     contracts: Sequence[Contract],
     *,
@@ -498,6 +619,16 @@ def build_for_regime(
             return build_vertical(contracts, is_put=False, risk_budget=risk_budget, **common)  # type: ignore[arg-type]
         case Structure.IRON_CONDOR:
             return build_iron_condor(contracts, risk_budget=risk_budget, **common)  # type: ignore[arg-type]
+        case Structure.BROKEN_WING_CONDOR:
+            # The trend structure (§4.4.2, B-1). Needs a direction: without a
+            # trend read the skew has nothing to point at, and a directionless
+            # broken-wing is just a worse symmetric condor — so decline and let
+            # the CHOP branch's plain condor handle the flat tape instead.
+            if verdict.trend is None:
+                return None
+            return build_broken_wing_condor(
+                contracts, trend=verdict.trend, risk_budget=risk_budget, **common  # type: ignore[arg-type]
+            )
         case Structure.LONG_STRANGLE:
             # The sleeve's default. Delta-neutral, so Gate 7 does not bind and it
             # can actually be sized to its budget — see `build_long_strangle`.

@@ -6,6 +6,21 @@ short_delta_target: 0.16
 short_delta_min: 0.15
 short_delta_max: 0.20
 
+# Broken-wing (delta-skewed) condor deltas — the TREND structure (§4.4.2, B-1).
+# B-1: a single vertical's credit/width equals the risk-neutral breach prob N(-d2),
+# which is mathematically pinned BELOW the short strike's |delta| — so at the 0.16
+# target above, credit/width tops out near 14-16% and can never reach Gate 9's 18%
+# floor. A condor collects TWO credits, so it clears the floor; skewing the short
+# deltas gives it the directional lean a trend regime wants without a naked side.
+#   near: the trend-favorable short strike, sold CLOSER (more credit, and a short
+#         put's +delta / short call's -delta is what tilts the package with-trend).
+#   far:  the opposite side, sold FURTHER out — small counter-credit, small offset.
+# Est. credit at $1 width: near(0.30)~22% + far(0.10)~9% ~= 31% of one width, well
+# clear of 18%. `near` deliberately exceeds short_delta_max: that band governs the
+# SYMMETRIC single-vertical thesis; the tilt is the whole point of this structure.
+skew_short_delta_near: 0.30
+skew_short_delta_far: 0.10
+
 # Days to expiry. 0DTE only after 10:30 and never entered after 14:30 (Gate 11).
 min_dte: 0
 max_dte: 2
