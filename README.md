@@ -85,14 +85,14 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `worker/` — pure cron table (`datetime → due cycles`) | ✅ |
 | `worker/` — broker adapter, sense step, six session runners, scheduler loop | ✅ |
 | `config/account.lock` + startup assertion | ✅ |
-| `agent/` — LLM portfolio manager | ⬜ (deterministic fallback is live) |
+| `agent/` — LLM portfolio manager (`gpt-5.5`, strict structured output, deterministic fallback) | ✅ |
 | `api/` — FastAPI read + control routes, SSE, desk page | ✅ |
 | Redis chain cache · arq LLM queue | ⬜ |
-| `journal/` — daily report, social draft | ⬜ |
+| `journal/` — session report (`python -m vigil.journal.report`), social draft | ✅ |
 | Docker Compose (`postgres` · `redis` · `migrate` · `worker` · `api`) | ✅ |
 | CI | ⬜ |
 
-Tests: 329 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
+Tests: 383 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
 
 ## Quick start
 

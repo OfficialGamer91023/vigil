@@ -1,0 +1,30 @@
+# The LLM portfolio manager (PLAN §6). The model *selects* from the menu the risk
+# kernel has already approved; it can never widen risk, so every knob here is a
+# tuning dial, not a safety control. The safety controls are in risk.yaml and are
+# not the model's to touch.
+
+# gpt-5.5 via the openai SDK Responses API (CLAUDE.md "LLM layer"). The model is
+# the judgement we pay for; the cost dial is `reasoning.effort`, never a downgrade
+# to a weaker model.
+model: "gpt-5.5"
+
+# `reasoning.effort` is the cost dial (§6.2). Routine entry cycles run ~30x a day
+# and are a bounded pick from a short menu — `low` is right. The daily review and
+# the social draft run once and read the whole journal — `high` earns its cost
+# there.
+entry_effort: "low"
+review_effort: "high"
+
+# A hard wall-clock ceiling on any single call. An entry cycle has a deadline; a
+# model that is slow does not get to hold the book hostage — the deterministic
+# fallback (§6.3) takes over at this boundary and the cycle proceeds.
+timeout_seconds: 20
+
+# Selection needs only an index and a sentence, so the output is tiny. This caps
+# a runaway generation rather than sizing a real budget.
+max_output_tokens: 2000
+
+# The master switch. False (or a missing OPENAI_API_KEY) means the deterministic
+# ranker runs and no call is made — the fallback is the whole system with the
+# model removed, which is exactly what §6.3 requires be runnable on its own.
+enabled: true

@@ -35,6 +35,25 @@ DEFAULT_NOW = datetime(2026, 8, 26, 11, 0, tzinfo=ET)
 
 
 # --------------------------------------------------------------------------- #
+# Network isolation
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(autouse=True)
+def _no_openai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may reach OpenAI, the same way none may reach Alpaca.
+
+    `build_manager()` reads OPENAI_API_KEY straight from the process environment,
+    and any earlier test that called `load_settings()` (which runs `load_dotenv`)
+    would have populated it for the rest of the pytest process. Stripping it here,
+    autouse, makes the entry path build *no* client by default: a test that wants
+    to exercise the model injects a fake `PortfolioManager` explicitly, and one
+    that does not gets the deterministic path — which is exactly the production
+    contract when the model is off (§6.3).
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+# --------------------------------------------------------------------------- #
 # Chain contracts
 # --------------------------------------------------------------------------- #
 

@@ -1,6 +1,6 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
 .PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker api cycle flatten cli db migrate lock \
-	up down logs ps build stack-migrate clean
+	report social up down logs ps build stack-migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
 # uv marks .venv hidden on macOS, and CPython's site.addpackage SILENTLY SKIPS
@@ -65,6 +65,19 @@ api:
 #   make cycle C=premarket | open | manage | entry | flatten | postclose
 cycle:
 	$(RUN) python -m vigil.worker.sessions $(C)
+
+# --- The journal: reports and social drafts (PLAN §7) -----------------------
+# Run inside the compose network (like `make migrate`), so DATABASE_URL already
+# points at the worker's Postgres and no host .env is required. `--no-deps`
+# because postgres is already up from `make up`. `make report D=2026-08-28` for a
+# specific session. A deterministic read — no broker, no model needed.
+report:
+	$(COMPOSE) run --rm --no-deps worker python -m vigil.journal.report $(if $(D),--date $(D),--today)
+
+# The day's build-in-public draft (§6.1). Uses the LLM when a key is present and
+# the deterministic template otherwise; prints, never posts.
+social:
+	$(COMPOSE) run --rm --no-deps worker python -m vigil.journal.social_draft
 
 # --- Docker Compose (PLAN §9) ------------------------------------------------
 # postgres + redis + migrate + worker + api.

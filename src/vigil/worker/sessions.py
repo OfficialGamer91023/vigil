@@ -34,10 +34,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
+from functools import lru_cache
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from vigil.account import verify_account
+from vigil.agent import PortfolioManager, Selection, build_manager
 from vigil.clock import now_et, today_et
 from vigil.config import (
     RiskConfig,
@@ -118,6 +120,11 @@ class RunnerContext:
     risk: RiskConfig
     strategy: StrategyConfig
     universe: tuple[str, ...]
+    # The LLM portfolio manager, or None when it is switched off or unkeyed —
+    # in which case the entry cycle ranks deterministically and never notices.
+    # A snapshot like everything else here, so a mid-session config change is
+    # picked up on the next cycle rather than held stale on a long-lived object.
+    pm: PortfolioManager | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +161,11 @@ async def open_context(broker: Broker, db: AsyncSession) -> RunnerContext:
         risk=risk_config(),
         strategy=scfg,
         universe=tuple(universe_config().primary),
+        # Deliberately not built here. The manager holds an HTTP client and only
+        # the entry cycle uses it, so constructing one for every premarket, manage
+        # and flatten cycle would churn connection pools for nothing. `run_entry`
+        # reaches for the process-level singleton instead; this field stays a seam
+        # for a test to inject a fake.
     )
 
 
@@ -353,25 +365,37 @@ async def _candidates(
     return out
 
 
+def _rank_key(proposal: TradeProposal) -> tuple[Decimal, Decimal]:
+    """The ordering both the ranker and the fallback share, in one place.
+
+    Credit as a share of width first — the one number Gate 9 already treats as the
+    quality of a premium sale, so *most compensation per dollar of risk* — then
+    lower max loss to break ties: same edge, smaller bet. Kept as a named function
+    so `_rank` and `_best` cannot drift into two different strategies.
+    """
+    return (-proposal.credit_pct_of_width, proposal.max_loss)
+
+
 def _rank(scored: list[tuple[TradeProposal, KernelDecision]]) -> list[TradeProposal]:
     """Order approved candidates best-first. **The deterministic fallback (§6.3).**
 
-    This is the selection the LLM portfolio manager will eventually make from the
-    same pre-validated set — and the path taken whenever the model is slow, rate
-    limited, or returns something the schema rejects. It exists first and stays
-    forever: §6.3 requires every LLM call to have a deterministic fallback, and a
-    fallback written after the model is a fallback nobody has run.
-
-    Ranked by credit as a share of width, which is the one number Gate 9 already
-    treats as the quality of a premium sale — most compensation per dollar of
-    risk taken. Ties break on lower max loss: same edge, smaller bet.
+    This is the selection the LLM portfolio manager makes from the same
+    pre-validated set when it is switched off — and the path taken whenever the
+    model is slow, rate limited, or returns something the schema rejects. It
+    exists first and stays forever: §6.3 requires every LLM call to have a
+    deterministic fallback, and a fallback written after the model is a fallback
+    nobody has run.
     """
-    return [
-        p
-        for p, _ in sorted(
-            scored, key=lambda pair: (-pair[0].credit_pct_of_width, pair[0].max_loss)
-        )
-    ]
+    return [p for p, _ in sorted(scored, key=lambda pair: _rank_key(pair[0]))]
+
+
+def _best(candidates: list[TradeProposal]) -> TradeProposal:
+    """The single deterministic winner — the callback the model falls back to.
+
+    Same key as `_rank`, so "the model chose" and "the model fell back" resolve to
+    byte-identical trades whenever the model would have agreed with the ranking.
+    """
+    return min(candidates, key=_rank_key)
 
 
 async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
@@ -393,6 +417,11 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
 
     context = KernelContext(now=now_et())
     scored: list[tuple[TradeProposal, KernelDecision]] = []
+    # client_order_id -> journalled proposal row id, so the LLM memo can be
+    # attached to the exact proposal the model chose. The id is unique and already
+    # the row's natural key, so it is the honest join back to the record.
+    id_by_coid: dict[str, int] = {}
+    cold_start = False
 
     for underlying in ctx.universe:
         view = await sense(ctx.broker, underlying, max_dte=ctx.strategy.max_dte)
@@ -402,6 +431,7 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
         result.warnings.extend(view.warnings)
         result.regime = view.verdict.regime.value
         result.cold_start = result.cold_start or view.verdict.cold_start
+        cold_start = cold_start or view.verdict.cold_start
 
         await J.record_market_snapshot(
             ctx.db,
@@ -428,13 +458,14 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
             decision = evaluate(candidate, state, ctx_for, ctx.risk)
             # **Every verdict is persisted, passes included** (§5). A table of
             # only rejections cannot answer "did any of this ever fire?".
-            await J.record_proposal(
+            prow = await J.record_proposal(
                 ctx.db, candidate, decision, cycle_id=result.cycle_id or 0
             )
             result.proposals += 1
             if decision.approved:
                 result.approved += 1
                 scored.append((candidate, decision))
+                id_by_coid[candidate.client_order_id] = prow.id
             else:
                 log.info(
                     "proposal.rejected", underlying=underlying,
@@ -445,8 +476,102 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
         result.note(f"{result.proposals} candidate(s), none approved")
         return
 
-    best = _rank(scored)[0]
-    await _submit(ctx, best, state, result)
+    selection = await _choose(ctx, scored, state, result.regime or "mixed", cold_start)
+    # The memo is journalled whatever the model decided — a stand-down and a
+    # fallback are both facts about the day worth keeping (§6.3 makes the fallback
+    # *rate* a headline number, which a table of only successes could not compute).
+    await _record_memo(ctx, selection, id_by_coid, cycle_id=result.cycle_id or 0)
+
+    if selection.stood_down:
+        result.note(f"PM stood down: {selection.memo or 'no memo'}")
+        return
+
+    await _submit(ctx, selection.proposal, state, result)
+
+
+# --------------------------------------------------------------------------- #
+# The portfolio manager: the model selects, or the ranker does (§6)
+# --------------------------------------------------------------------------- #
+
+@lru_cache(maxsize=1)
+def _portfolio_manager() -> PortfolioManager | None:
+    """The process-wide manager, or None on the deterministic path.
+
+    Cached because the client should live for the life of the worker, not be
+    rebuilt each entry cycle — and because the enable/key decision does not change
+    under a running process. A test never reaches this: it either injects a fake
+    on the context or runs with the key stripped, in which case the first call
+    here caches None and every entry cycle takes the deterministic path.
+    """
+    return build_manager()
+
+
+async def _choose(
+    ctx: RunnerContext,
+    scored: list[tuple[TradeProposal, KernelDecision]],
+    state: PortfolioState,
+    regime: str,
+    cold_start: bool,
+) -> Selection:
+    """Pick one proposal from the approved menu — via the model, or the ranker.
+
+    The menu handed to the model is the approved set only, and `_best` is the
+    fallback it defers to. Whatever comes back is still passed to `_submit`, which
+    re-runs the whole kernel: the model narrows an already-safe set and cannot
+    widen it, which is the structural form of "the LLM proposes, the kernel
+    disposes" (§6).
+    """
+    candidates = [p for p, _ in scored]
+    manager = ctx.pm or _portfolio_manager()
+    if manager is None:
+        # No model: the deterministic winner, wrapped so the memo path is uniform.
+        return Selection(
+            proposal=_best(candidates), fell_back=True,
+            model="deterministic", effort="none",
+            memo="deterministic ranker (model disabled)",
+        )
+
+    return await manager.select(
+        candidates, state,
+        regime=regime, cold_start=cold_start,
+        risk=ctx.risk, strategy=ctx.strategy,
+        fallback=_best,
+    )
+
+
+async def _record_memo(
+    ctx: RunnerContext,
+    selection: Selection,
+    id_by_coid: dict[str, int],
+    *,
+    cycle_id: int,
+) -> None:
+    """Persist the model's cost and reasoning to `llm_memos` (§6.2).
+
+    Linked to the chosen proposal so `GET /api/cycles/{id}` can show the memo
+    beside the verdicts it acted on. A memo write must never sink an entry, so a
+    failure here is logged and swallowed — the trade is the product, the memo is
+    the paperwork, and hard rule #6's "runs with the journal degraded" applies to
+    the observability tables first.
+    """
+    try:
+        await J.record_llm_memo(
+            ctx.db,
+            cycle_id=cycle_id,
+            proposal_id=id_by_coid.get(selection.proposal.client_order_id),
+            model=selection.model,
+            effort=selection.effort,
+            latency_ms=selection.latency_ms,
+            input_tokens=selection.input_tokens,
+            cached_tokens=selection.cached_tokens,
+            cache_write_tokens=selection.cache_write_tokens,
+            output_tokens=selection.output_tokens,
+            reasoning_tokens=selection.reasoning_tokens,
+            memo=selection.memo or None,
+            fell_back=selection.fell_back,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability must not sink a trade
+        log.warning("memo.write_failed", error=str(exc)[:200])
 
 
 async def _submit(

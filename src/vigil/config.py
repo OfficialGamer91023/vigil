@@ -186,6 +186,45 @@ class GreeksConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentConfig:
+    """The LLM portfolio manager's knobs (§6.2). See config/agent.yaml.
+
+    None of these are safety controls — the model selects from an already-gated
+    menu, so its worst case is a worse *legal* trade, never an illegal one. That
+    is why this is a separate config from `risk.yaml`: the two must not be tuned
+    with the same hand, and only `risk.yaml` is frozen after Day 4.
+
+    `enabled` is read here but the *effective* switch is `enabled AND a key is
+    present` — the manager treats a missing OPENAI_API_KEY as disabled rather than
+    as an error, because "run the deterministic path" is always a valid answer and
+    a crash on a missing key would violate §6.3's promise that the model is never
+    load-bearing.
+    """
+
+    model: str
+    entry_effort: str
+    review_effort: str
+    timeout_seconds: float
+    max_output_tokens: int
+    enabled: bool
+
+    @classmethod
+    def load(cls) -> AgentConfig:
+        a = _load("agent.yaml")
+        return cls(
+            model=str(a["model"]),
+            entry_effort=str(a["entry_effort"]),
+            review_effort=str(a["review_effort"]),
+            # float() not _dec(): a timeout is passed straight to the SDK/asyncio,
+            # which want a float, and it is not money — Decimal would buy nothing
+            # and only be converted back.
+            timeout_seconds=float(a["timeout_seconds"]),
+            max_output_tokens=int(a["max_output_tokens"]),
+            enabled=bool(a["enabled"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class UniverseConfig:
     primary: tuple[str, ...]
     secondary: tuple[str, ...]
@@ -216,3 +255,4 @@ strategy_config = lru_cache(maxsize=1)(StrategyConfig.load)
 universe_config = lru_cache(maxsize=1)(UniverseConfig.load)
 regime_config = lru_cache(maxsize=1)(RegimeConfig.load)
 greeks_config = lru_cache(maxsize=1)(GreeksConfig.load)
+agent_config = lru_cache(maxsize=1)(AgentConfig.load)

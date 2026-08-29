@@ -126,6 +126,13 @@ Kept here because a submission that hides them is worth less than one that does 
   pricing, greeks and liquidity checks.
 - **Index options (SPX/XSP/VIX) are not used.** They are tradeable in paper, but Alpaca
   serves no market data for them, and an agent cannot trade what it cannot quote.
-- **The LLM portfolio manager is not yet wired.** Selection currently runs on the
-  deterministic ranking that was always specified as its fallback — it exists first and
-  stays permanently, because a fallback written after the model is a fallback nobody has run.
+- **The LLM portfolio manager is wired, but the deterministic ranker is the tested
+  primary.** `gpt-5.5` (via the openai Responses API, strict structured output) selects at
+  most one structure from the menu the risk kernel has *already approved* — so the model can
+  only ever narrow a safe set, never widen it, and whatever it picks is re-gated at the
+  submit path. Every failure — timeout, error, an index off the end of the menu — falls back
+  to the same credit-per-width ranker, and the fallback rate and prompt-cache hit rate are
+  journalled to `llm_memos`. The model is never on the path for *closing* a position. It can
+  be switched off entirely with one flag (`config/agent.yaml: enabled`), in which case the
+  ranker runs and nothing else changes — because the fallback is the whole system with the
+  model removed, and it was written and tested first.
