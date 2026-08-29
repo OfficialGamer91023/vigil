@@ -80,8 +80,22 @@ build:
 
 # Brings up the stack. `migrate` runs to completion first (compose waits on
 # service_completed_successfully), so the worker never races a half-applied schema.
+#
+# `--build` is not a convenience. The Dockerfile bakes `src/` and `config/` into
+# the image rather than mounting them, and for `config/account.lock` that is a
+# deliberate reading of hard rule #7: re-pointing the agent at another account
+# should require a rebuild and redeploy, not a restart. The consequence is that a
+# plain `up -d` recreates containers from the *cached* image, so it happily runs
+# source and config that no longer match the working tree.
+#
+# That cost a session on 28 Aug 2026: `make lock` writes the lock on the host
+# (RUN is `uv run`, not a container), `make up` recreated from a pre-lock image,
+# and every cycle died with AccountLockError while the file sat plainly on disk.
+# Docker's layer cache keeps the no-op case at ~3.5s with no container recreated
+# (measured 28 Aug), so the honest default is that the image always matches the
+# tree. `make build` remains for building without starting anything.
 up:
-	$(COMPOSE) up -d
+	$(COMPOSE) up -d --build
 	@$(COMPOSE) ps
 
 down:
