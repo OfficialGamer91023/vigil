@@ -55,7 +55,7 @@ from vigil.db.session import get_session
 from vigil.domain import KernelDecision, OpenStructure, PortfolioState, TradeProposal
 from vigil.execution.manage import Action, ManagementDecision, sweep
 from vigil.execution.pricing import closing_limit, package_mid
-from vigil.execution.reconcile import structures_missing_targets
+from vigil.execution.reconcile import refresh_deltas, structures_missing_targets
 from vigil.execution.router import RiskKernelRejection
 from vigil.logging import get_logger
 from vigil.risk.context import KernelContext
@@ -412,8 +412,6 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
         return
 
     structures = await reconcile(ctx, result)
-    state = await _state(ctx, structures)
-    await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
 
     context = KernelContext(now=now_et())
     scored: list[tuple[TradeProposal, KernelDecision]] = []
@@ -423,6 +421,13 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
     id_by_coid: dict[str, int] = {}
     cold_start = False
 
+    # --- Phase 1: sense every underlying and journal its snapshot. -----------
+    # The chains are collected before *any* gating so the portfolio delta can be
+    # refreshed from a complete book: Gate 7 sums across all open structures, so a
+    # single un-refreshed one would understate the whole portfolio (D-1). Sensing
+    # and gating were one loop before; splitting them is what lets the state the
+    # kernel sees reflect the real book rather than a placeholder of zeros.
+    views: list[MarketView] = []
     for underlying in ctx.universe:
         # The accumulated daily IV (Option 3) so CHEAP_VOL can be ranked. Read
         # here, where the session runner owns the database, and passed in — `sense`
@@ -450,9 +455,31 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
             iv_pct=_opt_dec(view.verdict.iv_pct),
             trend=_opt_dec(view.verdict.trend),
         )
+        views.append(view)
 
+    # --- Refresh Gate 7's input, then freeze the state the gates see. --------
+    # `reconcile` leaves every structure's dollar delta at 0 (it has no chain); the
+    # sensed chains carry the deltas, so fold them in now (D-1). Any structure whose
+    # legs are not all in a sensed chain cannot be honestly priced and is surfaced,
+    # not silently counted as zero.
+    delta_by_symbol = {
+        c.occ.raw: c.delta for v in views for c in v.chain if c.delta is not None
+    }
+    spot_by_underlying = {v.underlying: v.spot for v in views}
+    structures, unpriced = refresh_deltas(structures, delta_by_symbol, spot_by_underlying)
+    if unpriced:
+        result.warnings.append(
+            f"Gate 7 delta unresolved for {len(unpriced)} open structure(s) "
+            f"(legs outside the sensed chain): "
+            + ", ".join(f"{s.underlying} {s.expiry}" for s in unpriced)
+        )
+    state = await _state(ctx, structures)
+    await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
+
+    # --- Phase 2: build and gate candidates against the refreshed book. ------
+    for view in views:
         if view.verdict.structure is None:
-            result.note(f"{underlying}: {view.verdict.regime.value} — stand down")
+            result.note(f"{view.underlying}: {view.verdict.regime.value} — stand down")
             continue
 
         # A context that knows which symbols the chain actually listed, so Gate 12
@@ -474,7 +501,7 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
                 id_by_coid[candidate.client_order_id] = prow.id
             else:
                 log.info(
-                    "proposal.rejected", underlying=underlying,
+                    "proposal.rejected", underlying=view.underlying,
                     structure=candidate.structure.value, reason=decision.summary,
                 )
 

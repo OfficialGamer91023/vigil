@@ -59,12 +59,26 @@ def imports_of(path: pathlib.Path) -> set[str]:
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
+            # Resolve the module the `from` clause names — absolute, or relative
+            # against this file's own package.
             if node.level:
                 parts = package.split(".")
                 base = ".".join(parts[: len(parts) - node.level + 1])
-                found.add(f"{base}.{node.module}" if node.module else base)
-            elif node.module:
-                found.add(node.module)
+                module = f"{base}.{node.module}" if node.module else base
+            else:
+                module = node.module
+            if module is None:
+                continue
+            found.add(module)
+            # `from pkg import name` may pull in a *submodule* `pkg.name`, not only a
+            # symbol: `from vigil.db.repositories import journal as J` reaches
+            # `vigil.db.repositories.journal`, whose own imports carry the rule.
+            # Record both spellings — `reachable_from` walks whichever resolves to a
+            # file and lets the other (a class, a function) stop with no file. Not
+            # doing this was the D-6 hole: the walk dead-ended at the empty
+            # `__init__.py` and never parsed the modules the API calls on every
+            # request, so an `import alpaca` added to `journal.py` stayed invisible.
+            found.update(f"{module}.{alias.name}" for alias in node.names)
     return found
 
 
@@ -130,6 +144,29 @@ def test_the_api_cannot_reach_the_trading_path(graph: dict[str, str], forbidden:
     )
 
 
+@pytest.mark.parametrize(
+    "reached", ["vigil.db.repositories.journal", "vigil.db.repositories.reporting"]
+)
+def test_the_walk_descends_through_aliased_submodule_imports(
+    graph: dict[str, str], reached: str
+) -> None:
+    """D-6 regression: the check must follow `from pkg import module`, not stop at pkg.
+
+    Both route files reach the repositories as `from vigil.db.repositories import
+    journal as J` / `reporting as R` — an import of a *submodule*, not a symbol. If
+    the walk records only the package (`vigil.db.repositories`, an empty
+    `__init__.py`) it dead-ends there, and the two modules the API calls on every
+    request are never parsed: an `import alpaca` added to `journal.py` would sail
+    straight through the FORBIDDEN check above. Proving the walk reaches these
+    modules is proving that check actually covers the code the API runs.
+    """
+    assert reached in graph, (
+        f"the API import walk never reached {reached} — hard rule #6's check stops "
+        f"at the empty package `__init__.py` (D-6). Its transitive imports, where a "
+        f"real violation would hide, are never examined."
+    )
+
+
 def test_only_deps_touches_settings_and_only_for_the_env_path() -> None:
     """The API never constructs a client, so it has no reason to read Alpaca keys.
 
@@ -175,4 +212,11 @@ def test_the_shared_control_vocabulary_imports_nothing(graph: dict[str, str]) ->
     started to share more than a vocabulary, and the next thing they share is
     state.
     """
-    assert imports_of(SRC / "vigil" / "control.py") <= {"__future__", "typing"}
+    # `imports_of` records both the module and each `from module import name`
+    # spelling (so `typing.Final` rides along with `typing`), so the check is on
+    # the top-level package of every import: nothing beyond these two stdlib
+    # modules may be pulled in — no first-party module, above all.
+    allowed = {"__future__", "typing"}
+    imports = imports_of(SRC / "vigil" / "control.py")
+    offending = {i for i in imports if i.split(".")[0] not in allowed}
+    assert not offending, offending

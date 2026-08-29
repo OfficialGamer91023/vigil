@@ -22,7 +22,8 @@ rather than a fallback.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from vigil.data.occ import parse_occ
@@ -166,6 +167,51 @@ def group_positions(
             ),
         ))
     return tuple(out)
+
+
+def refresh_deltas(
+    structures: tuple[OpenStructure, ...],
+    delta_by_symbol: Mapping[str, float | None],
+    spot_by_underlying: Mapping[str, Decimal],
+) -> tuple[tuple[OpenStructure, ...], tuple[OpenStructure, ...]]:
+    """Write a live dollar delta onto each reconciled structure. Pure.
+
+    `group_positions` cannot compute delta — a broker position carries no Greek,
+    and this module stays network-free, so the live chain is not in its scope. It
+    leaves `dollar_delta` at 0 (D-1); this fills it in once the sense step has a
+    chain, using the **same** formula as `TradeProposal.dollar_delta`
+    (Σ delta × 100 × spot × signed_qty, then × contracts) so a reconciled book and
+    a proposed trade are measured on one ruler — the ruler Gate 7 reads (§5.1).
+
+    Without this, `PortfolioState.net_dollar_delta` summed zeros and the
+    portfolio-wide delta gate silently saw a single trade. It only ever mattered on
+    the second concurrent position — exactly when Gate 7 is supposed to begin
+    refusing.
+
+    A structure is refreshed only when **every** leg has both a delta and a spot. A
+    partial refresh is worse than a flagged gap: Gate 7 would sum a half-priced
+    structure as if it were whole and *understate* the book in the safe-looking
+    direction. Anything that cannot be fully priced keeps its placeholder and is
+    returned in the second tuple for the caller to surface — never dropped, never
+    silently zeroed as if measured.
+    """
+    refreshed: list[OpenStructure] = []
+    unpriced: list[OpenStructure] = []
+    for s in structures:
+        spot = spot_by_underlying.get(s.underlying)
+        deltas = [delta_by_symbol.get(leg.symbol) for leg in s.legs]
+        if spot is None or not s.legs or any(d is None for d in deltas):
+            unpriced.append(s)
+            refreshed.append(s)  # keep the placeholder; it is flagged, not hidden
+            continue
+        total = Decimal(0)
+        for leg, d in zip(s.legs, deltas, strict=True):
+            # signed_ratio: +ratio_qty long, −ratio_qty short — the sign a short leg
+            # contributes to portfolio delta, mirroring `Leg.signed_ratio`.
+            signed_ratio = -leg.ratio_qty if leg.is_short else leg.ratio_qty
+            total += Decimal(str(d)) * CONTRACT_MULTIPLIER * spot * signed_ratio
+        refreshed.append(replace(s, dollar_delta=total * s.contracts))
+    return tuple(refreshed), tuple(unpriced)
 
 
 def structures_missing_targets(

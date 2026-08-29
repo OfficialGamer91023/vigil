@@ -12,11 +12,12 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from vigil.domain import Structure
+from vigil.domain import PortfolioState, Structure
 from vigil.execution.reconcile import (
     BrokerPosition,
     RestingOrder,
     group_positions,
+    refresh_deltas,
     structures_missing_targets,
 )
 
@@ -138,3 +139,98 @@ def test_a_partial_closing_order_does_not_count() -> None:
 
 def test_an_empty_account_reconciles_to_nothing() -> None:
     assert group_positions([]) == ()
+
+
+# --------------------------------------------------------------------------- #
+# refresh_deltas — folding live chain deltas onto a reconciled book (D-1).
+# `group_positions` cannot compute delta (no Greek on a broker position, no chain
+# in scope), so it leaves a placeholder 0 and this fills it in once the sense step
+# has a chain. Gate 7 reads the result, so getting the sign and the sum right is
+# what makes the portfolio delta gate mean anything on a book of more than one.
+# --------------------------------------------------------------------------- #
+
+def test_refresh_writes_the_dollar_delta_the_proposal_formula_would() -> None:
+    """Same ruler as `TradeProposal.dollar_delta`: Σ δ×100×spot×signed_qty × contracts.
+
+    A short put's negative delta becomes a *positive* portfolio delta (selling a
+    put is a bullish lean), so the two legs do not simply add.
+    """
+    (s,) = group_positions([SHORT_PUT, LONG_PUT])  # 4 contracts, $1-wide put spread
+    refreshed, unpriced = refresh_deltas(
+        (s,),
+        {SHORT_PUT.symbol: -0.16, LONG_PUT.symbol: -0.12},
+        {"SPY": Decimal(765)},
+    )
+    assert unpriced == ()
+    # short: -0.16 × 100 × 765 × (−1) = +12240 ; long: -0.12 × 100 × 765 × (+1) = −9180
+    # (12240 − 9180) × 4 contracts = 12240
+    assert refreshed[0].dollar_delta == Decimal(12240)
+
+
+def test_equal_deltas_on_the_two_legs_net_to_a_flat_structure() -> None:
+    """The sign check, stated on its own: a short and a long leg of equal delta
+    cancel, which is what "sell vol, not direction" looks like in this unit."""
+    (s,) = group_positions([SHORT_PUT, LONG_PUT])
+    refreshed, _ = refresh_deltas(
+        (s,), {SHORT_PUT.symbol: -0.15, LONG_PUT.symbol: -0.15}, {"SPY": Decimal(765)}
+    )
+    assert refreshed[0].dollar_delta == Decimal(0)
+
+
+def test_a_leg_off_the_sensed_chain_is_flagged_not_half_priced() -> None:
+    """A partial refresh is worse than a gap: Gate 7 would count a half-priced
+    structure as whole and understate the book. The structure keeps its placeholder
+    and is returned as unpriced for the caller to surface."""
+    (s,) = group_positions([SHORT_PUT, LONG_PUT])
+    refreshed, unpriced = refresh_deltas(
+        (s,), {SHORT_PUT.symbol: -0.16}, {"SPY": Decimal(765)}  # long leg missing
+    )
+    assert unpriced == (s,)
+    assert refreshed[0].dollar_delta == Decimal(0)
+
+
+def test_a_structure_on_an_unsensed_underlying_is_flagged() -> None:
+    (s,) = group_positions([SHORT_PUT, LONG_PUT])
+    refreshed, unpriced = refresh_deltas(
+        (s,), {SHORT_PUT.symbol: -0.16, LONG_PUT.symbol: -0.12}, {}  # no SPY spot
+    )
+    assert unpriced == (s,)
+    assert refreshed[0].dollar_delta == Decimal(0)
+
+
+def test_the_portfolio_delta_sums_the_whole_book_not_one_trade() -> None:
+    """The D-1 defect itself: `net_dollar_delta` summed placeholder zeros, so Gate 7
+    silently evaluated a single trade. With deltas refreshed it sees every open
+    structure — which is exactly when the gate is supposed to start refusing."""
+    (spy,) = group_positions([SHORT_PUT, LONG_PUT])
+    qqq_short = BrokerPosition("QQQ260827P00500000", Decimal(-4), Decimal("0.50"))
+    qqq_long = BrokerPosition("QQQ260827P00499000", Decimal(4), Decimal("0.30"))
+    (qqq,) = group_positions([qqq_short, qqq_long])
+
+    refreshed, unpriced = refresh_deltas(
+        (spy, qqq),
+        {
+            SHORT_PUT.symbol: -0.16, LONG_PUT.symbol: -0.12,
+            qqq_short.symbol: -0.16, qqq_long.symbol: -0.12,
+        },
+        {"SPY": Decimal(765), "QQQ": Decimal(500)},
+    )
+    assert unpriced == ()
+
+    before = PortfolioState(
+        equity=Decimal(100_000), peak_equity=Decimal(100_000),
+        day_pnl=Decimal(0), open_structures=(spy, qqq),  # the placeholder book
+    )
+    after = PortfolioState(
+        equity=Decimal(100_000), peak_equity=Decimal(100_000),
+        day_pnl=Decimal(0), open_structures=refreshed,
+    )
+    assert before.net_dollar_delta == Decimal(0)          # the bug: always zero
+    assert after.net_dollar_delta != Decimal(0)           # now the book is visible
+    assert after.net_dollar_delta == sum(
+        (r.dollar_delta for r in refreshed), Decimal(0)
+    )
+
+
+def test_refresh_of_an_empty_book_is_empty() -> None:
+    assert refresh_deltas((), {}, {}) == ((), ())

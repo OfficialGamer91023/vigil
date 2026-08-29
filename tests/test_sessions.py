@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select, text
 
 from tests.conftest import truncate_journal
+from vigil.clock import today_et
 from vigil.db.models import Cycle, OpenStructureRow
 from vigil.db.models import Order as OrderRow
 from vigil.db.repositories import journal as J
@@ -311,7 +312,7 @@ async def test_a_healthy_structure_is_held(no_lock):
 
 async def test_flatten_cancels_working_orders_before_closing(no_lock):
     """An entry filling at 15:41 would create a position after the flatten decided."""
-    structure = make_structure(expiry=date.today())
+    structure = make_structure(expiry=today_et())
     broker = StubBroker(
         structures=(structure,),
         quotes={
@@ -342,7 +343,7 @@ async def test_flatten_leaves_later_expiries_alone(no_lock):
 
 async def test_an_incomplete_flatten_is_loud(no_lock):
     """A position that could not be closed at 15:40 is the worst thing in the book."""
-    structure = make_structure(expiry=date.today())
+    structure = make_structure(expiry=today_et())
     broker = StubBroker(structures=(structure,), quotes={})   # nothing priceable
     async with get_session() as db:
         ctx = await _context(broker, db)
@@ -383,7 +384,7 @@ async def test_a_requested_flatten_keeps_the_flag_until_the_book_is_empty(no_loc
     the honest state after submitting is "asked, not confirmed". Clearing the flag
     here would resume trading on the strength of an order that may never fill.
     """
-    structure = make_structure(expiry=date.today())
+    structure = make_structure(expiry=today_et())
     broker = StubBroker(
         structures=(structure,),
         quotes={
@@ -489,7 +490,7 @@ async def test_the_halt_flag_does_not_stop_management(no_lock):
 
 async def test_the_flatten_flag_preempts_any_cycle(no_lock, monkeypatch):
     """`/api/control/flatten` at 11:02 is not a request to finish the 11:02 sweep."""
-    structure = make_structure(expiry=date.today())
+    structure = make_structure(expiry=today_et())
     broker = StubBroker(
         structures=(structure,),
         quotes={
