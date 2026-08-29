@@ -424,7 +424,13 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
     cold_start = False
 
     for underlying in ctx.universe:
-        view = await sense(ctx.broker, underlying, max_dte=ctx.strategy.max_dte)
+        # The accumulated daily IV (Option 3) so CHEAP_VOL can be ranked. Read
+        # here, where the session runner owns the database, and passed in — `sense`
+        # stays journal-free like the kernel it feeds.
+        real_iv = await J.daily_iv_history(ctx.db, underlying)
+        view = await sense(
+            ctx.broker, underlying, max_dte=ctx.strategy.max_dte, real_iv_history=real_iv
+        )
         if view is None:
             result.warnings.append(f"no tradeable chain for {underlying}")
             continue
@@ -670,7 +676,13 @@ async def market_open(ctx: RunnerContext, result: CycleResult) -> None:
     await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
 
     for underlying in ctx.universe:
-        view = await sense(ctx.broker, underlying, max_dte=ctx.strategy.max_dte)
+        # The accumulated daily IV (Option 3) so CHEAP_VOL can be ranked. Read
+        # here, where the session runner owns the database, and passed in — `sense`
+        # stays journal-free like the kernel it feeds.
+        real_iv = await J.daily_iv_history(ctx.db, underlying)
+        view = await sense(
+            ctx.broker, underlying, max_dte=ctx.strategy.max_dte, real_iv_history=real_iv
+        )
         if view is None:
             result.warnings.append(f"no tradeable chain for {underlying} at the open")
             continue

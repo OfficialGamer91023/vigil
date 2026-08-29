@@ -13,13 +13,16 @@ signal in its own right (§1.2).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
 from vigil.clock import today_et
+from vigil.config import regime_config
 from vigil.data.bars import daily_closes, prev_close_and_open, session_closes
 from vigil.data.chain import Contract
 from vigil.signals.history import rv_history
+from vigil.signals.iv_seed import build_iv_history
 from vigil.signals.regime import MarketSnapshot, RegimeVerdict, classify
 from vigil.signals.vol import realized_vol
 from vigil.worker.broker import Broker
@@ -45,7 +48,12 @@ class MarketView:
 
 
 async def sense(
-    broker: Broker, underlying: str, *, max_dte: int, strike_window: Decimal = Decimal(25)
+    broker: Broker,
+    underlying: str,
+    *,
+    max_dte: int,
+    strike_window: Decimal = Decimal(25),
+    real_iv_history: Sequence[float] = (),
 ) -> MarketView | None:
     """Gather everything the router needs. `None` when there is no tradeable chain.
 
@@ -54,6 +62,13 @@ async def sense(
     has a deadline; concurrently it is one. It also matters for the 200 req/min
     ceiling only in the sense that it does not make it worse — `gather` changes
     the latency, not the request count.
+
+    `real_iv_history` is the accumulated daily IV the caller read from the journal
+    (`journal.daily_iv_history`). It defaults empty so the dashboard and tests can
+    sense without a database; when supplied it lets the CHEAP_VOL regime come
+    online via the Option 3 seed (§4.3.1). Deliberately an argument rather than a
+    read inside `sense`: this function stays free of the journal, exactly like the
+    kernel, and the one place that owns the database is the session runner.
     """
     spot = await broker.spot(underlying)
 
@@ -89,6 +104,19 @@ async def sense(
 
     prev_close, session_open = prev_close_and_open(closes, spot)
     atm = min(chain, key=lambda c: abs(c.occ.strike - spot))
+    iv_atm = atm.iv or 0.0
+
+    rv_hist = list(rv_history(underlying))
+    # Option 3: the accumulated real IV, padded with a synthetic band shaped by the
+    # realized-vol distribution, so the CHEAP_VOL percentile is rankable before the
+    # free tier ever serves a single historical IV. Empty `real_iv_history` on day
+    # one still yields a usable band anchored to today's measurement.
+    iv_hist = build_iv_history(
+        real_iv_history,
+        iv_atm=iv_atm,
+        rv_history=rv_hist,
+        min_sessions=regime_config().iv_seed_min_sessions,
+    )
 
     snapshot = MarketSnapshot(
         underlying=underlying,
@@ -96,14 +124,15 @@ async def sense(
         prev_close=prev_close,
         session_open=session_open,
         daily_closes=closes,
-        iv_atm=atm.iv or 0.0,
+        iv_atm=iv_atm,
         rv_annual=rv,
-        # No historical implied vol on the free tier, so these accumulate forward
-        # one session at a time; empty drops the router onto the documented
-        # cold-start path (§4.3.1) rather than onto a guess.
+        # `vrp_history` still has no historical-IV source, so it accumulates forward
+        # one session at a time and stays empty for now — the cold-start VRP path
+        # (§4.3.1) handles that. `iv_history` is now seeded (above) so CHEAP_VOL is
+        # reachable rather than permanently dark.
         vrp_history=[],
-        iv_history=[],
-        rv_history=list(rv_history(underlying)),
+        iv_history=iv_hist,
+        rv_history=rv_hist,
     )
 
     return MarketView(

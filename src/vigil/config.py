@@ -151,6 +151,9 @@ class RegimeConfig:
     vrp_stress_pct: Decimal
     stress_gap_pct: Decimal
     cheap_vol_iv_pct: Decimal
+    vrp_raw_rich_abs: Decimal
+    vrp_override_size: Decimal
+    iv_seed_min_sessions: int
 
     @classmethod
     def load(cls) -> RegimeConfig:
@@ -163,6 +166,11 @@ class RegimeConfig:
             vrp_stress_pct=_dec(r, "vrp_stress_pct"),
             stress_gap_pct=_dec(r, "stress_gap_pct"),
             cheap_vol_iv_pct=_dec(r, "cheap_vol_iv_pct"),
+            vrp_raw_rich_abs=_dec(r, "vrp_raw_rich_abs"),
+            vrp_override_size=_dec(r, "vrp_override_size"),
+            # Option 3 — how many IV points (real + synthetic seed) before the
+            # CHEAP_VOL percentile is allowed to mean something. See signals/iv_seed.py.
+            iv_seed_min_sessions=int(r["iv_seed_min_sessions"]),
         )
 
 

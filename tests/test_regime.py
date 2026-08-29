@@ -98,6 +98,61 @@ def test_vrp_below_the_sell_floor_declines_to_sell_premium() -> None:
     assert v.structure is None
 
 
+# --------------------------------------------------------------------------- #
+# Option 1 — the cold-start vrp_raw override of the sell floor (§4.3.1)
+# --------------------------------------------------------------------------- #
+
+def test_rich_vrp_raw_overrides_the_cold_start_sell_floor_at_reduced_size() -> None:
+    """A real IV−RV measurement beats the proxy that benched us.
+
+    Cold start, the RV proxy lands the VRP percentile in the sell-floor zone
+    (10–40%), but the real vrp_raw shows premium demonstrably rich — so the router
+    trades at reduced size rather than standing down.
+    """
+    calm = [0.10 + i / 1000 for i in range(60)]     # 0.100 .. 0.159
+    # rv=0.14 ranks high in `calm` -> proxy VRP ~33% (sell-floor zone).
+    # iv=0.20 -> vrp_raw=0.06, well over the 0.03 rich floor.
+    v = classify(snap(vrp_history=[], iv_atm=0.20, rv_annual=0.14, rv_history=calm))
+    assert v.cold_start is True
+    assert v.vrp_pct is not None and 0.10 < v.vrp_pct < 0.40
+    assert v.structure is not None                  # not benched
+    assert v.size_multiplier == Decimal("0.5")      # but at reduced size
+    assert "override" in v.reason
+
+
+def test_the_override_does_not_fire_when_vrp_raw_is_not_rich() -> None:
+    """Same benching proxy, but the real measurement does not confirm rich premium."""
+    calm = [0.10 + i / 1000 for i in range(60)]
+    # iv=0.15 -> vrp_raw=0.01, below the 0.03 floor: no override, stand down.
+    v = classify(snap(vrp_history=[], iv_atm=0.15, rv_annual=0.14, rv_history=calm))
+    assert v.cold_start is True
+    assert v.size_multiplier == Decimal(0)
+    assert v.structure is None
+
+
+def test_the_override_never_touches_a_warm_percentile() -> None:
+    """A real VRP distribution is trusted as-is — the override is cold-start only.
+
+    The default snap carries a full `vrp_history`, so even with a rich vrp_raw the
+    sell-floor stand-down stands: we are not second-guessing a real percentile.
+    """
+    # iv=0.14, rv=0.12 -> vrp_raw=0.02 (< floor anyway) and warm vrp_pct ~35%.
+    v = classify(snap(iv_atm=0.14, rv_annual=0.12))
+    assert v.cold_start is False
+    assert v.size_multiplier == Decimal(0)
+    assert v.structure is None
+
+
+def test_the_override_cannot_rescue_a_stress_or_gap_veto() -> None:
+    """The stress decile and the gap veto sit above the sell floor and are final."""
+    # A large gap: STRESS, size 0, regardless of how rich vrp_raw is.
+    v = classify(snap(vrp_history=[], iv_atm=0.30, rv_annual=0.14,
+                       rv_history=[0.10 + i / 1000 for i in range(60)],
+                       session_open=Decimal("755.00")))
+    assert v.regime is Regime.STRESS
+    assert v.size_multiplier == Decimal(0)
+
+
 def test_every_verdict_carries_the_numbers_it_reasoned_from() -> None:
     """A regime call that cannot be audited is an opinion."""
     v = classify(snap())

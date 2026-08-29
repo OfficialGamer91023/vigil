@@ -216,3 +216,46 @@ async def test_money_round_trips_exactly_as_decimal(cycle_id, put_credit_spread)
         p = (await s.execute(select(Proposal).where(Proposal.id == pid))).scalar_one()
     assert isinstance(p.net_credit, Decimal)
     assert p.net_credit == Decimal("0.20")
+
+
+# --------------------------------------------------------------------------- #
+# Option 3 — accumulated daily IV, read back for the CHEAP_VOL seed (§4.3.1)
+# --------------------------------------------------------------------------- #
+
+async def test_daily_iv_history_returns_one_open_reading_per_session_oldest_first():
+    """Two sessions, several snapshots each; the read collapses to one IV per day
+    (the earliest — the open read) and returns them chronologically."""
+    from vigil.db.repositories.journal import daily_iv_history
+
+    tag = f"test-{os.urandom(6).hex()}"
+    async with get_session() as s:
+        acct = (await s.execute(text(
+            "INSERT INTO accounts (alpaca_account_id, starting_equity) "
+            "VALUES (:a, 100000) RETURNING id"), {"a": tag})).scalar_one()
+        for day, ivs in ((date(2026, 8, 27), [0.19, 0.20]), (date(2026, 8, 28), [0.15, 0.16])):
+            sess = (await s.execute(text(
+                "INSERT INTO sessions (account_id, trading_date) VALUES (:a, :d) RETURNING id"),
+                {"a": acct, "d": day})).scalar_one()
+            for iv in ivs:
+                cyc = (await s.execute(text(
+                    "INSERT INTO cycles (session_id, kind) VALUES (:s, 'entry') RETURNING id"),
+                    {"s": sess})).scalar_one()
+                await s.execute(text(
+                    "INSERT INTO market_snapshots (cycle_id, underlying, spot, iv_atm) "
+                    "VALUES (:c, 'SPY', 765, :iv)"), {"c": cyc, "iv": iv})
+            # A second underlying that must not leak into SPY's series.
+            cyc2 = (await s.execute(text(
+                "INSERT INTO cycles (session_id, kind) VALUES (:s, 'entry') RETURNING id"),
+                {"s": sess})).scalar_one()
+            await s.execute(text(
+                "INSERT INTO market_snapshots (cycle_id, underlying, spot, iv_atm) "
+                "VALUES (:c, 'QQQ', 480, 0.30)"), {"c": cyc2})
+
+    try:
+        async with get_session() as s:
+            series = await daily_iv_history(s, "SPY")
+        # One per day, oldest first, the earliest (open) reading of each day.
+        assert series == [0.19, 0.15]
+    finally:
+        async with get_session() as s:
+            await s.execute(text("DELETE FROM accounts WHERE id = :a"), {"a": acct})

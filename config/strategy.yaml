@@ -67,12 +67,32 @@ regime:
   vrp_sell_floor_pct: 0.40      # below this, do not sell premium
   vrp_stress_pct: 0.10          # bottom decile: vol is cheap relative to recent pricing
 
+  # Option 1 — the cold-start VRP override (§4.3.1). With no historical IV the
+  # VRP percentile comes from the realized-vol proxy, which can bench us even when
+  # implied vol is demonstrably rich over realized. When we are on that proxy path
+  # AND the *real* vrp_raw (annualized IV − annualized RV) clears this absolute
+  # floor, override the sell-floor STAND-DOWN and trade at reduced size instead.
+  # A measurement beats a proxy assumption; the caution is kept as size, not a veto.
+  # Only ever loosens the cold-start path — a real percentile is trusted untouched,
+  # and the STRESS decile and gap vetoes are never overridden.
+  vrp_raw_rich_abs: 0.03        # IV must exceed RV by >= 3 annualized vol points
+  vrp_override_size: 0.5        # size when trading on the override, not a full stand-down
+
   # An overnight gap this large means the model's assumptions were made in a
   # different market than the one that opened.
   stress_gap_pct: 0.012
 
   # CHEAP-VOL funds the convexity sleeve: buy movement when it is on sale.
   cheap_vol_iv_pct: 0.33
+
+  # Option 3 — bootstrap the IV percentile the CHEAP_VOL regime needs (§4.3.1).
+  # The free tier serves no historical IV, so the series accumulates forward from
+  # `market_snapshots` and is padded with a synthetic band (anchored to the first
+  # measured IV, shaped by the realized-vol distribution) up to this many points.
+  # Below this, iv_pct stays unranked and CHEAP_VOL stays offline — a percentile
+  # over too few points is noise, and firing the convexity sleeve on noise bleeds
+  # theta. See signals/iv_seed.py.
+  iv_seed_min_sessions: 20
 
 # --- Local greeks (§1.3, the A1 fallback) -----------------------------------
 # A1 was MEASURED on 28 Aug 2026 and failed: the free indicative feed omits

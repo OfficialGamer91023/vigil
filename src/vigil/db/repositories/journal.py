@@ -446,6 +446,35 @@ async def record_market_snapshot(
     return row
 
 
+async def daily_iv_history(session: AsyncSession, underlying: str) -> list[float]:
+    """One measured ATM IV per trading day, oldest first — the accumulated series.
+
+    Option 3's "accumulate forward" half (§4.3.1). There is no historical IV on
+    the free tier, but the worker writes `iv_atm` to `market_snapshots` every
+    cycle, so a real daily series accrues on its own; this reads it back for the
+    IV-percentile seed (`signals.iv_seed.build_iv_history`).
+
+    `DISTINCT ON (trading_date)` with the matching leading `ORDER BY` collapses the
+    many snapshots a day to the **first** one — the open read — which is the most
+    consistent daily representative (every session is sensed at 09:45, not every
+    session reaches an entry cycle). Re-sorted to chronological afterwards because
+    `DISTINCT ON` dictates the primary sort key, not the caller's preferred one.
+    """
+    rows = await session.execute(
+        select(Session.trading_date, MarketSnapshotRow.iv_atm)
+        .distinct(Session.trading_date)
+        .join(Cycle, Cycle.id == MarketSnapshotRow.cycle_id)
+        .join(Session, Session.id == Cycle.session_id)
+        .where(
+            MarketSnapshotRow.underlying == underlying,
+            MarketSnapshotRow.iv_atm.isnot(None),
+        )
+        .order_by(Session.trading_date, Cycle.started_at)
+    )
+    pairs = sorted(rows.all(), key=lambda r: r[0])
+    return [float(iv) for _, iv in pairs if iv is not None]
+
+
 async def is_flag_active(session: AsyncSession, name: str) -> bool:
     """Read a control flag. A missing row is inactive — the safe default.
 

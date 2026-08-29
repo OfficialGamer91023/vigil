@@ -140,20 +140,40 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
     if cold_start:
         vrp_pct = _cold_start_vrp_pct(snap)
 
+    # The size every fall-through verdict inherits. Normally 1; the cold-start VRP
+    # override (below) drops it so the trend/chop read trades at reduced size
+    # instead of the sell floor benching us. A plain variable read by the closure
+    # rather than an argument, so the override sets it once and every later branch
+    # picks it up without each call having to remember to pass it.
+    base_size = Decimal(1)
+    override_active = False
+
     def verdict(
         regime: Regime,
         structure: Structure | None,
         reason: str,
-        size_multiplier: Decimal = Decimal(1),
+        size_multiplier: Decimal | None = None,
     ) -> RegimeVerdict:
         """Closes over the measured values so every branch reports the same context.
 
         A local closure rather than a dict splat: `**kwargs` would erase the types
         and let a renamed field fail at runtime instead of at type-check time.
+
+        `size_multiplier=None` means "inherit `base_size`" — the branches that set
+        their own size (STRESS, CHEAP_VOL) pass it explicitly; the trend/chop
+        branches leave it None and so honour an override transparently.
         """
+        sm = base_size if size_multiplier is None else size_multiplier
+        # Mark only the branches that actually ran under the override — a verdict
+        # that set its own size did not.
+        note = (
+            " (vrp_raw override: IV rich over RV, proxy sell-floor bypassed at reduced size)"
+            if override_active and size_multiplier is None
+            else ""
+        )
         return RegimeVerdict(
-            regime=regime, structure=structure, reason=reason,
-            cold_start=cold_start, size_multiplier=size_multiplier,
+            regime=regime, structure=structure, reason=reason + note,
+            cold_start=cold_start, size_multiplier=sm,
             trend=trend, vrp_pct=vrp_pct, iv_pct=iv_pct,
         )
 
@@ -191,13 +211,25 @@ def classify(snap: MarketSnapshot, cfg: RegimeConfig | None = None) -> RegimeVer
             f"IV percentile {iv_pct:.0%} in the bottom third — buy movement while "
             f"it is on sale")
 
-    # Below the sell floor we are not paid enough to be short premium.
+    # Below the sell floor we are not paid enough to be short premium — UNLESS we
+    # are on the proxy path and the *real* vrp_raw shows premium is demonstrably
+    # rich (Option 1, §4.3.1). An absolute IV−RV measurement is more trustworthy
+    # than the realized-vol proxy that produced this percentile, so it may bypass
+    # the stand-down. It may only bypass on the cold-start path: a real percentile
+    # is trusted as it is, and the STRESS decile and gap vetoes above are never
+    # reachable from here, so this cannot override a genuine stress signal.
     if Decimal(str(vrp_pct)) < c.vrp_sell_floor_pct:
-        return verdict(
-            Regime.STRESS, None,
-            f"VRP percentile {vrp_pct:.0%} below the {c.vrp_sell_floor_pct:.0%} "
-            f"sell floor — not paid enough to be short premium",
-            size_multiplier=Decimal(0))
+        rich = raw is not None and Decimal(str(raw)) >= c.vrp_raw_rich_abs
+        if not (cold_start and rich):
+            return verdict(
+                Regime.STRESS, None,
+                f"VRP percentile {vrp_pct:.0%} below the {c.vrp_sell_floor_pct:.0%} "
+                f"sell floor — not paid enough to be short premium",
+                size_multiplier=Decimal(0))
+        # Override: drop through to the trend/chop read, but at reduced size. The
+        # proxy's caution is respected as *size*, not as a veto.
+        base_size = c.vrp_override_size
+        override_active = True
 
     if trend is None:
         return verdict(
