@@ -11,14 +11,14 @@ Skipped, not failed, when no Postgres is reachable.
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select, text
 
 from tests.conftest import truncate_journal
-from vigil.clock import today_et
+from vigil.clock import ET, today_et
 from vigil.db.models import Cycle, OpenStructureRow
 from vigil.db.models import Order as OrderRow
 from vigil.db.repositories import journal as J
@@ -27,6 +27,16 @@ from vigil.domain import OpenStructure, PositionLeg, Structure
 from vigil.worker import sessions as S
 from vigil.worker.broker import AccountView
 from vigil.worker.schedule import CycleKind
+
+# A fixed weekday mid-session moment. The breach-close path turns on
+# `minutes_to_close(now)`, which reads the **live** wall clock through `now_et()`:
+# after ~15:40 ET (and all weekend) the sweep correctly declines to cross a spread
+# into the imminent flatten, so a test asserting a breach *close* must pin the
+# clock to mid-session or it fails every afternoon the suite happens to run. 11:00
+# on a Tuesday leaves 300 minutes to the 16:00 close — comfortably over the 30-min
+# breach-exit floor — and is decoupled from `date.today()` so the result never
+# depends on when or where the tests run.
+MID_SESSION = datetime(2026, 9, 1, 11, 0, tzinfo=ET)
 
 pytestmark = pytest.mark.db
 
@@ -248,9 +258,10 @@ async def test_a_structure_with_no_resting_exit_is_reported_as_a_defect(no_lock)
 # manage
 # --------------------------------------------------------------------------- #
 
-async def test_a_breached_structure_is_closed_and_journalled(no_lock):
+async def test_a_breached_structure_is_closed_and_journalled(no_lock, monkeypatch):
     """Spot through the short strike with hours left: close, and say why."""
-    structure = make_structure(expiry=date.today() + timedelta(days=1))
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
     broker = StubBroker(
         structures=(structure,),
         spot=Decimal(750),                       # below the 755 short put
@@ -273,13 +284,14 @@ async def test_a_breached_structure_is_closed_and_journalled(no_lock):
     assert result.closed == 1
 
 
-async def test_an_unpriceable_leg_blocks_the_close_loudly(no_lock):
+async def test_an_unpriceable_leg_blocks_the_close_loudly(no_lock, monkeypatch):
     """Hard rule #5: no market orders. So no quote means no order, and an alarm.
 
     The alternative — crossing with a market order because the position "must"
     close — is exactly the invitation §1.2 warns about on an indicative feed.
     """
-    structure = make_structure(expiry=date.today() + timedelta(days=1))
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
     broker = StubBroker(
         structures=(structure,),
         spot=Decimal(750),
@@ -464,14 +476,15 @@ async def test_the_halt_flag_stops_entries(no_lock):
     assert "HALT flag active" in result.summary
 
 
-async def test_the_halt_flag_does_not_stop_management(no_lock):
+async def test_the_halt_flag_does_not_stop_management(no_lock, monkeypatch):
     """A halt stops the agent taking risk *on*, never taking it *off*.
 
     Gate 3 makes the same distinction — it halts new entries while management
     keeps running — and a halt that closed that door too would turn a bad day
     into an unmanaged one.
     """
-    structure = make_structure(expiry=date.today() + timedelta(days=1))
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
     broker = StubBroker(
         structures=(structure,),
         spot=Decimal(750),
