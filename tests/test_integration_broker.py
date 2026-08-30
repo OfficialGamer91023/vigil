@@ -468,6 +468,7 @@ async def _run_one_entry(broker, monkeypatch):
     """Set up the account/session/cycle rows the FKs require, then run one entry
     cycle. Returns the finished `CycleResult` and the account row id."""
     monkeypatch.setattr(S, "verify_account", lambda **_k: "acct-test")
+    monkeypatch.setattr(S, "verify_clock", lambda **_k: 0.0)
     # Phase 2 off: the wire under test ends at `record_equity`, upstream of building.
     monkeypatch.setattr(S, "build_for_regime", lambda *a, **k: None)
 

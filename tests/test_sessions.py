@@ -176,12 +176,32 @@ def make_structure(
 
 @pytest.fixture
 def no_lock(monkeypatch):
-    """The account assertion is tested in tests/test_account.py; stub it here."""
+    """Neutralise the two startup guards here — each is tested in its own file
+    (`test_account.py`, `test_clock_guard.py`) — so these session tests exercise
+    session logic against a network-free fake broker whose `.client` is inert."""
     monkeypatch.setattr(S, "verify_account", lambda **_kwargs: "acct-test")
+    monkeypatch.setattr(S, "verify_clock", lambda **_kwargs: 0.0)
 
 
 async def _context(broker, db):
     return await S.open_context(broker, db)
+
+
+async def test_open_context_refuses_a_drifted_clock(no_lock, monkeypatch):
+    """The clock guard rides the startup path with the account lock's fail-closed
+    contract: a drift failure aborts the cycle, it is not swallowed. Overrides the
+    `no_lock` stub with one that raises to prove `open_context` actually calls it
+    and lets the error propagate."""
+    from vigil.clock_guard import ClockDriftError
+
+    def _drifted(**_kwargs):
+        raise ClockDriftError("CLOCK DRIFT (test)")
+
+    monkeypatch.setattr(S, "verify_clock", _drifted)
+    broker = StubBroker(structures=(make_structure(),))
+    async with get_session() as db:
+        with pytest.raises(ClockDriftError):
+            await S.open_context(broker, db)
 
 
 # --------------------------------------------------------------------------- #

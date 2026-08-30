@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from vigil.account import verify_account
 from vigil.agent import PortfolioManager, Selection, build_manager
 from vigil.clock import now_et, today_et
+from vigil.clock_guard import verify_clock
 from vigil.config import (
     LadderConfig,
     RiskConfig,
@@ -132,19 +133,27 @@ class RunnerContext:
 
 
 # --------------------------------------------------------------------------- #
-# Startup: the account lock, the account row, today's session row
+# Startup: the account lock, the clock guard, the account row, today's session row
 # --------------------------------------------------------------------------- #
 
 async def open_context(broker: Broker, db: AsyncSession) -> RunnerContext:
-    """Verify the lock, then get-or-create the account and session rows.
+    """Verify the lock and the clock, then get-or-create the account and session rows.
 
     **The lock is checked before anything else touches the broker**, and it
     raises rather than warns (hard rule #7). Every cycle calls this, not just the
     premarket one: a worker restarted mid-session against a re-keyed `.env` is
     exactly the case a startup-only check would miss.
+
+    The clock guard rides alongside it for the same reason and with the same
+    fail-closed contract: every time gate keys off the local clock, so a host whose
+    time has drifted mislabels expiries and can skip the 0DTE flatten. Checking it
+    each cycle, not once at boot, catches an NTP step or a suspend/resume that moves
+    the clock mid-session. Both blocking reads are called synchronously here, as
+    `verify_account` already is — this is startup, run once per cycle, not the hot path.
     """
     account = await broker.account()
     verify_account(client=broker.client)
+    verify_clock(client=broker.client)
 
     account_row = await J.ensure_account(
         db, alpaca_account_id=account.account_id, starting_equity=account.equity
