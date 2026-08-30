@@ -9,11 +9,12 @@ a login box. Mutating routes are a different question entirely — see
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from vigil.api.deps import Db, db_session
@@ -170,8 +171,21 @@ async def flags(db: Db) -> list[ControlFlagOut]:
 STREAM_POLL_SECONDS = 2.0
 
 
+# Tripped by the ASGI lifespan on shutdown (`main.lifespan`). A bare `while True`
+# generator never returns, so uvicorn's graceful shutdown — which waits on the
+# lifespan, which cannot complete until every open response finishes — hangs for
+# as long as a browser tab is left open. This event is the shutdown signal every
+# open stream watches so it can return promptly instead of pinning the process.
+_shutdown = asyncio.Event()
+
+
+def signal_shutdown() -> None:
+    """Ask every open SSE generator to finish and return. Called from the lifespan."""
+    _shutdown.set()
+
+
 @router.get("/api/stream", tags=["read"])
-async def stream() -> StreamingResponse:
+async def stream(request: Request) -> StreamingResponse:
     """Server-Sent Events: pushes a frame whenever a new cycle lands.
 
     **Polling the journal rather than subscribing to Redis pub/sub**, which is
@@ -194,7 +208,13 @@ async def stream() -> StreamingResponse:
         # browser the stream is alive before the first real event, which on a
         # quiet market could otherwise be many minutes away.
         yield ": vigil stream open\n\n"
-        while True:
+        # Two exit conditions, not one: `_shutdown` for a graceful app stop, and
+        # `is_disconnected()` for the tab that simply went away. Without the second,
+        # a closed tab would keep polling the database every 2s until the process
+        # dies — a slow leak that only shows up under a demo full of reconnects.
+        while not _shutdown.is_set():
+            if await request.is_disconnected():
+                break
             async with get_session() as db:
                 rows = await R.recent_cycles(db, limit=1)
                 if rows and rows[0].id != last_seen:
@@ -206,7 +226,11 @@ async def stream() -> StreamingResponse:
                     # from timing the connection out without the client having to
                     # filter no-op messages.
                     yield ": keepalive\n\n"
-            await asyncio.sleep(STREAM_POLL_SECONDS)
+            # An interruptible sleep: wake the instant shutdown is signalled rather
+            # than holding the lifespan open for up to a full poll interval. The
+            # timeout is the normal path; the event set is the shutdown path.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(_shutdown.wait(), timeout=STREAM_POLL_SECONDS)
 
     return StreamingResponse(
         events(),

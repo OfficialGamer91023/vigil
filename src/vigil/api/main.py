@@ -33,6 +33,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure()
     log.info("api.start")
     yield
+    # Tell open SSE streams to return *before* disposing the engine: their loop
+    # holds a session per iteration, and a generator still spinning through
+    # `get_session()` while the pool is torn down races the dispose. Signalling
+    # first lets each stream finish its current tick and exit cleanly.
+    routes_read.signal_shutdown()
     from vigil.db.session import engine
 
     await engine().dispose()

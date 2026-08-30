@@ -1,4 +1,8 @@
-"""Realized vol and the VRP percentile — the two §4.3.1 bugs, as tests."""
+"""Realized vol — §4.3.1 Bug 1 (units), as tests.
+
+Bug 2 (the `vrp_raw > 0` sign test degenerating) is covered where the ranking now
+lives: `percentile_rank` in `test_iv_seed.py`.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,7 @@ import math
 
 import pytest
 
-from vigil.signals.vol import BARS_PER_SESSION, TRADING_DAYS, realized_vol, vrp_percentile
+from vigil.signals.vol import BARS_PER_SESSION, TRADING_DAYS, realized_vol
 
 
 def test_realized_vol_is_annualized_not_per_bar() -> None:
@@ -33,18 +37,3 @@ def test_flat_session_has_zero_vol() -> None:
 def test_too_few_bars_returns_none_rather_than_a_noisy_number() -> None:
     assert realized_vol([100.0, 101.0, 100.5]) is None
     assert realized_vol([]) is None
-
-
-def test_vrp_percentile_ranks_instead_of_subtracting() -> None:
-    """Bug 2: `vrp_raw > 0` is true nearly every day, so STRESS would never fire."""
-    history = [float(i) for i in range(100)]        # 0..99
-    assert vrp_percentile(5.0, history) == 0.05     # bottom decile -> STRESS fires
-    assert vrp_percentile(95.0, history) == 0.95
-    # Every value here is positive, so a sign test would classify all of them
-    # identically. The percentile still separates them — that is the whole point.
-    assert vrp_percentile(5.0, history) != vrp_percentile(95.0, history)
-
-
-def test_short_history_returns_none_so_the_caller_takes_the_cold_start_path() -> None:
-    assert vrp_percentile(1.0, []) is None
-    assert vrp_percentile(1.0, [0.5]) is None

@@ -476,16 +476,24 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
     state = await _state(ctx, structures)
     await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
 
+    # The symbols each underlying's chain actually listed, so Gate 12 can check
+    # strike existence instead of skipping the check. Built once and reused both
+    # here (the scoring pass) and at `_submit` (the binding pass) — the binding
+    # run rebuilding a *bare* context was the surviving half of the Gate-12 hole:
+    # the gate that guards the order reaching the broker was the one running blind.
+    symbols_by_underlying = {
+        v.underlying: frozenset(c.occ.raw for c in v.chain) for v in views
+    }
+
     # --- Phase 2: build and gate candidates against the refreshed book. ------
     for view in views:
         if view.verdict.structure is None:
             result.note(f"{view.underlying}: {view.verdict.regime.value} — stand down")
             continue
 
-        # A context that knows which symbols the chain actually listed, so Gate 12
-        # can check existence instead of skipping the check.
-        symbols = frozenset(c.occ.raw for c in view.chain)
-        ctx_for = KernelContext(now=context.now, available_symbols=symbols)
+        ctx_for = KernelContext(
+            now=context.now, available_symbols=symbols_by_underlying[view.underlying]
+        )
 
         for candidate in await _candidates(ctx, view, state):
             decision = evaluate(candidate, state, ctx_for, ctx.risk)
@@ -519,7 +527,22 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
         result.note(f"PM stood down: {selection.memo or 'no memo'}")
         return
 
-    await _submit(ctx, selection.proposal, state, result)
+    # The cycle row records *one* regime (journal §5). Phase 1 left `result.regime`
+    # at whichever underlying was sensed last (e.g. QQQ); the honest value is the
+    # regime of the symbol we actually traded, which each proposal already carries
+    # per-leg. Overwrite it now, before the cycle is finalised (O-2).
+    if selection.proposal.regime is not None:
+        result.regime = selection.proposal.regime.value
+
+    await _submit(
+        ctx,
+        selection.proposal,
+        state,
+        result,
+        available_symbols=symbols_by_underlying.get(
+            selection.proposal.underlying, frozenset()
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -608,7 +631,12 @@ async def _record_memo(
 
 
 async def _submit(
-    ctx: RunnerContext, proposal: TradeProposal, state: PortfolioState, result: CycleResult
+    ctx: RunnerContext,
+    proposal: TradeProposal,
+    state: PortfolioState,
+    result: CycleResult,
+    *,
+    available_symbols: frozenset[str] = frozenset(),
 ) -> None:
     """Hand the winner to the single submit path and journal what came back.
 
@@ -616,8 +644,14 @@ async def _submit(
     *selection*, this one is the one that binds. A rejection here is therefore not
     a redundancy failure but a real one (the book moved between ranking and
     submitting), and it is journalled rather than retried.
+
+    `available_symbols` is threaded through to the binding context so Gate 12
+    checks strike existence on the run that actually reaches the broker, not only
+    on the scoring run (O-2). An empty set is the "not supplied" sentinel that
+    makes Gate 12 skip (see `KernelContext`) — the pre-fix behaviour — so callers
+    must supply the traded underlying's chain symbols.
     """
-    context = KernelContext(now=now_et())
+    context = KernelContext(now=now_et(), available_symbols=available_symbols)
     try:
         outcome = await ctx.broker.submit_entry(
             proposal, state, context, risk=ctx.risk, strategy=ctx.strategy
@@ -627,8 +661,9 @@ async def _submit(
         log.warning("entry.rejected_at_submit", reason=exc.decision.summary)
         return
 
+    entry_row = None
     if outcome.entry_order is not None:
-        await J.record_order(
+        entry_row = await J.record_order(
             ctx.db,
             client_order_id=str(outcome.entry_order.client_order_id),
             broker_order_id=str(outcome.entry_order.id),
@@ -654,6 +689,25 @@ async def _submit(
         return
 
     result.submitted += 1
+
+    # Record the fill against the entry order (D-5). The `fills` table is the only
+    # place a *partial* is a first-class row rather than a note buried in a string:
+    # §6.3 makes the partial rate a headline number, and "how often were we
+    # partialled?" has to be a query, not a grep. `record_fill` was written but
+    # never called — the row was silently dropped on every fill until now.
+    if entry_row is not None and outcome.entry_order is not None:
+        filled_avg = getattr(outcome.entry_order, "filled_avg_price", None)
+        await J.record_fill(
+            ctx.db,
+            order_id=entry_row.id,
+            filled_qty=outcome.filled_contracts,
+            # Paper can leave the avg price unset on an odd fill; a zero here is an
+            # honest "unknown", never a real $0 fill, and keeps the NUMERIC column
+            # non-null. The order row still carries the limit we actually asked for.
+            filled_avg_price=Decimal(str(filled_avg)) if filled_avg else Decimal(0),
+            partial=outcome.partial,
+        )
+
     result.note(
         f"FILLED {proposal.structure.value} {proposal.underlying} {proposal.expiry} "
         f"x{outcome.filled_contracts} @ rung {outcome.rungs_used}"

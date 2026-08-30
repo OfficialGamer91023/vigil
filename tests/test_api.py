@@ -103,6 +103,21 @@ async def test_every_control_route_refuses_a_wrong_token(client, token, route) -
     assert r.status_code == 403
 
 
+async def test_a_non_ascii_token_is_403_not_500(client, token) -> None:
+    """`secrets.compare_digest` on two `str` raises `TypeError` the moment either
+    holds a non-ASCII character, which turned a garbage bearer token into a 500
+    (an operator-looking error) instead of a clean 403. The guard now compares the
+    UTF-8 bytes, so a Unicode token is simply *wrong*, never a crash.
+
+    The header is sent as **latin-1 bytes**, which is what a real client puts on
+    the wire (HTTP header values are ISO-8859-1) and what Starlette decodes back
+    into a non-ASCII `str` — httpx's default ASCII str-encoding would never let
+    the offending byte reach the server, so it cannot reproduce the bug."""
+    header = {"Authorization": "Bearer wrong-tøken".encode("latin-1")}
+    r = await client.post("/api/control/halt", headers=header, json={})
+    assert r.status_code == 403
+
+
 @pytest.mark.parametrize(
     "header",
     [

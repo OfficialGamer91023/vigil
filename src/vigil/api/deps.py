@@ -90,7 +90,12 @@ async def require_control_token(
             # to guess from a bare 401.
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not secrets.compare_digest(presented, expected):
+    # Compare the UTF-8 *bytes*, not the strings. `secrets.compare_digest` on two
+    # `str` requires both to be ASCII-only and raises `TypeError` on a non-ASCII
+    # character — so a bearer token with any Unicode byte crashed the guard into a
+    # 500 instead of a clean 403. Encoding both sides makes it a byte-vs-byte
+    # constant-time compare that rejects, rather than errors, on garbage input.
+    if not secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Invalid control token."
         )

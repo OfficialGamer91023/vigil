@@ -1,14 +1,14 @@
-"""Realized volatility and the VRP percentile (PLAN §4.3.1).
+"""Realized volatility for the VRP calculation (PLAN §4.3.1).
 
-Two bugs this module exists to prevent:
+The bug this module exists to prevent — **units.** ATM IV from the chain is
+*annualized*. A per-5-minute realized vol is not. Subtracting them is meaningless,
+so `realized_vol` annualizes before anything compares the two.
 
-**Bug 1 — units.** ATM IV from the chain is *annualized*. A per-5-minute realized
-vol is not. Subtracting them is meaningless, so `realized_vol` annualizes before
-anything compares the two.
-
-**Bug 2 — the sign test degenerates.** Short-dated IV sits above trailing RV on
-nearly every session, so `vrp_raw > 0` is true almost always and the STRESS regime
-never fires. `vrp_percentile` ranks instead of subtracting.
+The second §4.3.1 bug — the `vrp_raw > 0` sign test degenerates because short-dated
+IV sits above trailing RV nearly every session — is handled downstream: the regime
+router ranks `vrp_raw` within its trailing distribution via
+`indicators.percentile_rank`, not by subtracting. (An earlier `vrp_percentile`
+helper here duplicated that ranking and nothing called it; it was removed.)
 """
 
 from __future__ import annotations
@@ -37,16 +37,3 @@ def realized_vol(closes: list[float]) -> float | None:
     if len(rets) < MIN_BARS:
         return None
     return statistics.stdev(rets) * math.sqrt(BARS_PER_SESSION * TRADING_DAYS)
-
-
-def vrp_percentile(vrp_raw: float, history: list[float]) -> float | None:
-    """Where `vrp_raw` sits within its own trailing distribution, in [0, 1].
-
-    Returns None when history is too short to rank against — the caller must then
-    take the §4.3.1 cold-start path *and log that it is doing so*, rather than
-    silently reasoning from an empty distribution.
-    """
-    if len(history) < 2:
-        return None
-    below = sum(1 for h in history if h < vrp_raw)
-    return below / len(history)

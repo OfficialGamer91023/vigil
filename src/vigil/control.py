@@ -26,7 +26,3 @@ HALT_FLAG: Final = "halt"
 #: any of them — someone hitting `/api/control/flatten` at 11:02 is not asking for
 #: the 11:02 manage sweep to finish first.
 FLATTEN_FLAG: Final = "flatten"
-
-#: Every flag the control plane knows about. Used to reject an unknown name at the
-#: route boundary instead of writing a row nothing will ever read.
-KNOWN_FLAGS: Final = frozenset({HALT_FLAG, FLATTEN_FLAG})
