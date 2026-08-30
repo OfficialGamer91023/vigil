@@ -8,7 +8,7 @@ becoming a `None` threshold inside a risk gate at 09:31.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import date, time
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -150,6 +150,78 @@ class StrategyConfig:
         )
 
 
+_LADDER_WHEN = frozenset({"any", "behind", "ahead"})
+
+
+def _as_date(value: Any) -> date:
+    """Accept either a YAML-parsed `date` or an ISO string.
+
+    `yaml.safe_load` turns an unquoted `2026-08-28` into a `date` already, but a
+    quoted one stays a string — so both spellings are valid in the file and neither
+    should be a load-time surprise.
+    """
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+@dataclass(frozen=True, slots=True)
+class LadderRung:
+    """One row of the §4.7 escalation table. See `strategy/ladder.py` for how a
+    rung is selected and why `core_risk_pct` is a request, not the final size."""
+
+    min_sessions_left: int
+    when: str
+    convexity_share: Decimal
+    core_risk_pct: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class LadderConfig:
+    """The escalation ladder (§4.7), loaded from strategy.yaml's `ladder:` block.
+
+    Validated hard at load time because a malformed ladder is a sizing bug waiting
+    for 09:31: an unknown `when` or a missing catch-all rung would leave
+    `resolve_rung` with no answer for some standing, and "no answer" during sizing
+    is the failure this whole codebase is built to prevent.
+    """
+
+    session_dates: tuple[date, ...]
+    day_pnl_target_pct: Decimal
+    rungs: tuple[LadderRung, ...]
+
+    @classmethod
+    def load(cls) -> LadderConfig:
+        block = _load("strategy.yaml")["ladder"]
+        rungs = tuple(
+            LadderRung(
+                min_sessions_left=int(row["min_sessions_left"]),
+                when=str(row["when"]),
+                convexity_share=Decimal(str(row["convexity_share"])),
+                core_risk_pct=Decimal(str(row["core_risk_pct"])),
+            )
+            for row in block["rungs"]
+        )
+        for r in rungs:
+            if r.when not in _LADDER_WHEN:
+                raise ValueError(
+                    f"ladder rung `when: {r.when!r}` is not one of {sorted(_LADDER_WHEN)}"
+                )
+        # The catch-all is what makes rung selection a total function — see
+        # `resolve_rung`. Refuse to load a table that could leave a standing
+        # unmatched rather than discover it at sizing time.
+        if not any(r.min_sessions_left == 0 and r.when == "any" for r in rungs):
+            raise ValueError(
+                "ladder is missing its catch-all rung (min_sessions_left: 0, "
+                "when: any); some (sessions_left, P&L) standing would match nothing."
+            )
+        return cls(
+            session_dates=tuple(_as_date(d) for d in block["session_dates"]),
+            day_pnl_target_pct=_dec(block, "day_pnl_target_pct"),
+            rungs=rungs,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RegimeConfig:
     ema_fast: int
@@ -268,6 +340,7 @@ class UniverseConfig:
 # Config is read once per process; the files do not change under a running worker.
 risk_config = lru_cache(maxsize=1)(RiskConfig.load)
 strategy_config = lru_cache(maxsize=1)(StrategyConfig.load)
+ladder_config = lru_cache(maxsize=1)(LadderConfig.load)
 universe_config = lru_cache(maxsize=1)(UniverseConfig.load)
 regime_config = lru_cache(maxsize=1)(RegimeConfig.load)
 greeks_config = lru_cache(maxsize=1)(GreeksConfig.load)

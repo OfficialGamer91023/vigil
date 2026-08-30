@@ -27,7 +27,7 @@ import pytest
 
 from tests.conftest import DEFAULT_NOW
 from vigil.clock import today_et
-from vigil.config import risk_config, strategy_config
+from vigil.config import ladder_config, risk_config, strategy_config
 from vigil.data.bars import SessionBars
 from vigil.db.models import EquitySnapshot
 from vigil.db.models import Fill as FillRow
@@ -355,6 +355,7 @@ async def test_a_fill_is_recorded_to_the_fills_table(
             trading_date=DEFAULT_NOW.date(),
             risk=risk_config(),
             strategy=strategy_config(),
+            ladder=ladder_config(),
             universe=("SPY",),
             pm=None,
         )

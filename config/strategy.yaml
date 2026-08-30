@@ -66,6 +66,48 @@ convexity_strangle_delta: 0.16
 # Exit at a multiple of the premium paid instead: 2.0 = close on a 100% gain.
 convexity_profit_target_multiple: 2.0
 
+# --- Escalation ladder (§4.7) -----------------------------------------------
+# The tournament dial. As sessions run out and the agent falls behind, tilt the
+# mix toward convexity (the only convex payoff in the book) and lift core size —
+# but ONLY within Gate 2's ceiling, never above it. Deterministic config, fully
+# logged, and re-checked by the kernel: the ladder proposes, Gate 2 still disposes.
+ladder:
+  # The six-session calendar (§4.7). `sessions_left` counts dates on/after today,
+  # so it is 6 on Fri 28 Aug, 5 on Mon 31 Aug, ... 1 on the final Fri 4 Sep.
+  # Unquoted ISO dates; YAML parses them to date objects and the loader accepts
+  # either those or strings.
+  session_dates:
+    - 2026-08-28
+    - 2026-08-31
+    - 2026-09-01
+    - 2026-09-02
+    - 2026-09-03
+    - 2026-09-04
+
+  # Day P&L at or above this counts as "ahead" — good enough that protecting the
+  # gain (the de-risk rung) beats pressing. A proxy for tournament rank, which the
+  # free tier cannot show us. The theta core makes ~0.1%/win, so +2% is a genuinely
+  # strong session; below it we are "behind" and the escalation rungs apply.
+  day_pnl_target_pct: 0.02
+
+  # The rungs, read FIRST to LAST as a decision table (§4.7). A rung is selected
+  # when `sessions_left >= min_sessions_left` AND its `when` matches the standing
+  # (any / behind / ahead). Order is the semantics: the ≥4 rung claims the early
+  # sessions before any escalation rung, and the trailing `when: any` rung is the
+  # mandatory catch-all (an "ahead" back-half session falls through to it).
+  #
+  # `core_risk_pct` is the REQUEST; Gate 2's `max_risk_per_trade_pct` (0.02) is the
+  # cap. The 0.025 rungs are deliberately left as written in §4.7 and clamped in
+  # code to 0.02 — the escalation they carry is expressed as convexity share, not
+  # as a per-trade loss the kernel would reject. Do not "fix" them upward here; the
+  # ceiling lives in risk.yaml and is frozen after Day 4.
+  rungs:
+    - {min_sessions_left: 4, when: any,    convexity_share: 0.20, core_risk_pct: 0.020}
+    - {min_sessions_left: 3, when: behind, convexity_share: 0.30, core_risk_pct: 0.020}
+    - {min_sessions_left: 2, when: behind, convexity_share: 0.40, core_risk_pct: 0.025}
+    - {min_sessions_left: 1, when: behind, convexity_share: 0.50, core_risk_pct: 0.025}
+    - {min_sessions_left: 0, when: any,    convexity_share: 0.15, core_risk_pct: 0.015}
+
 # --- Regime router (§4.3) ---------------------------------------------------
 regime:
   # Trend is EMA(fast) vs EMA(slow) on daily closes, expressed as a fraction of

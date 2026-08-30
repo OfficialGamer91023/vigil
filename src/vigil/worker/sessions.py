@@ -42,8 +42,10 @@ from vigil.account import verify_account
 from vigil.agent import PortfolioManager, Selection, build_manager
 from vigil.clock import now_et, today_et
 from vigil.config import (
+    LadderConfig,
     RiskConfig,
     StrategyConfig,
+    ladder_config,
     risk_config,
     strategy_config,
     universe_config,
@@ -61,6 +63,7 @@ from vigil.logging import get_logger
 from vigil.risk.context import KernelContext
 from vigil.risk.kernel import evaluate
 from vigil.strategy.candidates import build_for_regime
+from vigil.strategy.ladder import effective_core_risk_pct, resolve_rung
 from vigil.worker.broker import Broker, portfolio_state
 from vigil.worker.schedule import CycleKind
 from vigil.worker.sense import MarketView, sense
@@ -119,6 +122,7 @@ class RunnerContext:
     trading_date: date
     risk: RiskConfig
     strategy: StrategyConfig
+    ladder: LadderConfig
     universe: tuple[str, ...]
     # The LLM portfolio manager, or None when it is switched off or unkeyed —
     # in which case the entry cycle ranks deterministically and never notices.
@@ -160,6 +164,7 @@ async def open_context(broker: Broker, db: AsyncSession) -> RunnerContext:
         trading_date=today_et(),
         risk=risk_config(),
         strategy=scfg,
+        ladder=ladder_config(),
         universe=tuple(universe_config().primary),
         # Deliberately not built here. The manager holds an HTTP client and only
         # the entry cycle uses it, so constructing one for every premarket, manage
@@ -334,7 +339,12 @@ async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruc
 # --------------------------------------------------------------------------- #
 
 async def _candidates(
-    ctx: RunnerContext, view: MarketView, state: PortfolioState
+    ctx: RunnerContext,
+    view: MarketView,
+    state: PortfolioState,
+    *,
+    core_risk_pct: Decimal,
+    convexity_share: Decimal,
 ) -> list[TradeProposal]:
     """Every buildable candidate for one underlying, across live expiries.
 
@@ -342,8 +352,13 @@ async def _candidates(
     builder, so a proposal is sized against the book as it actually is. They are
     an input to sizing, not a substitute for the gates: Gate 2 and Gate 7 re-check
     both, and the kernel's answer is the binding one.
+
+    `core_risk_pct` and `convexity_share` come from the escalation ladder (§4.7),
+    already resolved and Gate-2-clamped by the caller, so this function stays a
+    pure "size against these budgets" step with no knowledge of the tournament
+    calendar — the two concerns are kept in separate places on purpose.
     """
-    risk_budget = ctx.risk.max_risk_per_trade_pct * state.equity
+    risk_budget = core_risk_pct * state.equity
     delta_budget = (
         ctx.risk.max_dollar_delta_pct * state.equity - abs(state.net_dollar_delta)
     )
@@ -359,6 +374,7 @@ async def _candidates(
             remaining_delta_budget=delta_budget,
             open_interest=view.open_interest,
             config=ctx.strategy,
+            convexity_share=convexity_share,
         )
         if candidate is not None:
             out.append(candidate)
@@ -476,6 +492,24 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
     state = await _state(ctx, structures)
     await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
 
+    # --- The escalation ladder picks this cycle's size regime (§4.7). --------
+    # Resolved once: it depends only on the tournament calendar and the day's P&L,
+    # not on any single underlying, and applies to every candidate below. Core risk
+    # is capped at Gate 2's ceiling *here* (never above it), so the ladder can only
+    # tilt the convexity mix and size *down* — the kernel then re-checks the result
+    # anyway, making a mis-tuned rung a rejected trade, not an oversized one.
+    rung = resolve_rung(ctx.trading_date, state.day_pnl_pct, ctx.ladder)
+    core_risk_pct = effective_core_risk_pct(rung, ctx.risk.max_risk_per_trade_pct)
+    result.note(f"ladder: {rung.label}")
+    if core_risk_pct < rung.core_risk_pct:
+        # Fires when a 2.5% rung meets the 2.0% ceiling: the escalation then lives
+        # entirely in the convexity share, and the journal records why the two
+        # differ rather than leaving a reader to wonder which number won.
+        result.note(
+            f"core risk clamped {rung.core_risk_pct:.1%} → {core_risk_pct:.1%} "
+            f"at the Gate 2 ceiling"
+        )
+
     # The symbols each underlying's chain actually listed, so Gate 12 can check
     # strike existence instead of skipping the check. Built once and reused both
     # here (the scoring pass) and at `_submit` (the binding pass) — the binding
@@ -495,7 +529,11 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
             now=context.now, available_symbols=symbols_by_underlying[view.underlying]
         )
 
-        for candidate in await _candidates(ctx, view, state):
+        for candidate in await _candidates(
+            ctx, view, state,
+            core_risk_pct=core_risk_pct,
+            convexity_share=rung.convexity_share,
+        ):
             decision = evaluate(candidate, state, ctx_for, ctx.risk)
             # **Every verdict is persisted, passes included** (§5). A table of
             # only rejections cannot answer "did any of this ever fire?".

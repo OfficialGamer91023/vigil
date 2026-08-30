@@ -578,6 +578,7 @@ def build_for_regime(
     remaining_delta_budget: Decimal,
     open_interest: dict[str, int] | None = None,
     config: StrategyConfig | None = None,
+    convexity_share: Decimal | None = None,
 ) -> TradeProposal | None:
     """Turn a regime verdict into the structure that regime actually asked for.
 
@@ -596,8 +597,15 @@ def build_for_regime(
     The convexity sleeve takes a *share* of the risk budget (§4.5), not the whole
     of it — a debit spread is the one structure that can lose its entire premium
     without the underlying doing anything unusual.
+
+    `convexity_share` overrides the static config share when the caller has an
+    escalation-ladder rung to apply (§4.7): as sessions run out and the agent is
+    behind, the ladder tilts more of the budget into the convex sleeve. `None`
+    means "no ladder in play" and falls back to the config default, so every
+    existing caller and test keeps its current behaviour untouched.
     """
     cfg = config or strategy_config()
+    sleeve_share = cfg.convexity_risk_share if convexity_share is None else convexity_share
     common: dict[str, object] = dict(
         underlying=underlying,
         spot=spot,
@@ -634,7 +642,7 @@ def build_for_regime(
             # can actually be sized to its budget — see `build_long_strangle`.
             # No trend read is needed: CHEAP-VOL is a claim about magnitude.
             return build_long_strangle(
-                contracts, risk_budget=risk_budget * cfg.convexity_risk_share, **common  # type: ignore[arg-type]
+                contracts, risk_budget=risk_budget * sleeve_share, **common  # type: ignore[arg-type]
             )
         case Structure.DEBIT_SPREAD:
             # Kept as a selectable structure rather than routed to by a regime:
@@ -645,7 +653,7 @@ def build_for_regime(
             # coin flip with a premium attached, so decline rather than guess.
             if verdict.trend is None:
                 return None
-            sleeve = risk_budget * cfg.convexity_risk_share
+            sleeve = risk_budget * sleeve_share
             return build_debit_spread(
                 contracts, is_put=verdict.trend < 0, risk_budget=sleeve, **common  # type: ignore[arg-type]
             )
