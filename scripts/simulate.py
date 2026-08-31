@@ -427,18 +427,60 @@ def _install_bar_stubs(world: World, regime: str) -> None:
 # The harness.
 # --------------------------------------------------------------------------- #
 
+class RealJournalRefused(SystemExit):
+    """The target database holds the locked trading account — truncation refused."""
+
+
+async def _guard_not_the_real_journal() -> None:
+    """Refuse to run if this database holds the locked live account (hard rule #7).
+
+    `make sim` truncates the whole journal for a clean slate. Against the local
+    scratch DB that is harmless — but a `DATABASE_URL` pointed at the container's
+    real journal (5433) would wipe the actual trading record. So before touching
+    anything, look for an account row matching `config/account.lock`; its presence
+    means we are aimed at the real journal, and we abort instead of truncating.
+
+    The check runs in its own session so an unmigrated scratch DB (no `accounts`
+    table) fails open — there is nothing real there to protect.
+    """
+    from sqlalchemy import text
+
+    from vigil.account import read_lock
+    from vigil.db.session import get_session
+
+    locked = read_lock()
+    if locked is None:                       # no lock written → nothing to protect
+        return
+    async with get_session() as db:
+        try:
+            hit = (await db.execute(
+                text("SELECT 1 FROM accounts WHERE alpaca_account_id = :a LIMIT 1"),
+                {"a": locked},
+            )).first()
+        except Exception:                    # noqa: BLE001 — no accounts table = scratch DB
+            hit = None
+    if hit is not None:
+        raise RealJournalRefused(
+            f"REFUSING TO RUN: this database holds the locked trading account "
+            f"({locked}). `make sim` truncates the journal and must never touch the "
+            f"real one. Unset DATABASE_URL to use the local scratch DB, or point it "
+            f"at a throwaway database."
+        )
+
+
 async def _reset_journal() -> None:
     """Empty every journal table so each run is a clean slate (like the test suite).
 
     The table list is the mapped metadata, never a hand-kept literal — a table
-    added to `db/models.py` is truncated here automatically. Sim only; it never
-    runs against a database anyone is trading from.
+    added to `db/models.py` is truncated here automatically. Guarded: it refuses
+    to run against the locked trading account's journal (see the guard above).
     """
     from sqlalchemy import text
 
     from vigil.db.models import Base
     from vigil.db.session import get_session
 
+    await _guard_not_the_real_journal()
     names = ", ".join(
         t.name for t in Base.metadata.sorted_tables if t.name != "alembic_version"
     )
