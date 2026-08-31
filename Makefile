@@ -56,6 +56,13 @@ dry-run:
 smoke:
 	$(RUN) python scripts/a4_mleg_smoke.py
 
+# Offline full-day simulator: the whole pipeline (sense -> gate -> submit -> fill
+# -> manage -> flatten) on a synthetic BS-priced chain, real kernel + router, no
+# network. Needs the journal DB, like `make test`. Steer it with
+#   make sim ARGS="--regime chop"   |   make sim ARGS="--seed 7"
+sim:
+	$(RUN) python scripts/simulate.py $(ARGS)
+
 # --- The agent (PLAN §2.3) --------------------------------------------------
 # The in-process scheduler. No Redis, no API, no web — hard rule #6 says the
 # worker must run correctly with all three stopped, and this is that claim being
