@@ -53,11 +53,13 @@ Cycles run on a fixed in-process schedule: `manage` every 15 minutes (tightened 
 - **Core & Data:** `Python 3.12` · `uv` · `alpaca-py` (trading + options chain snapshots) · Alpaca CLI (ops only)
 - **Storage:** `Postgres 16` · `SQLAlchemy 2.0 async` · `asyncpg` · `Alembic` — money is `Decimal`/`NUMERIC`, never float
 - **Validation & Quality:** `Pydantic`-style frozen dataclasses at the kernel boundary · `ruff` · `mypy --strict` · `pytest` · `hypothesis`
+- **AI Agent:** `openai` SDK against the **Responses API**, model `gpt-5.5`, strict `json_schema` structured outputs, `reasoning.effort` as the cost dial · deterministic ranker as the tested fallback on every path
+- **API / Cache:** `FastAPI` (read + control only, never trades) · a server-rendered desk page · `Redis` (optional chain-snapshot cache — never the record; the worker trades with it stopped)
 
-**Planned (see roadmap below):**
-- **AI Agent:** `openai` SDK against the **Responses API**, model `gpt-5.5`, strict `json_schema` structured outputs, `reasoning.effort` as the cost dial · Alpaca MCP attached read-only
-- **API / Cache:** `FastAPI` (read + control only, never trades) · `Redis` (chain-snapshot cache, SSE fanout) · `arq` (queued slow LLM jobs only — *not* the trading loop)
-- **Frontend:** a server-rendered page for the demo URL; a `Next.js` desk terminal is post-hackathon polish
+**Deferred / cut:**
+- **arq LLM queue** — the LLM runs inline in the cycle; arq was reserved for slow jobs only and is currently unused (hard rule #6 is why the *trading loop* was never put on it).
+- **Alpaca MCP read-only toolsets** — selection reads a menu built into the prompt, not live tools.
+- **Next.js desk terminal** — post-hackathon polish; the server-rendered page already satisfies the demo-URL requirement.
 
 Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index options (SPX/XSP — Alpaca serves no market data for them), Celery/RabbitMQ, a backtesting framework, TA-Lib, an options pricing library, market orders, a mark-based stop-loss, a ≤5% token convexity hedge, polling for profit targets, running the loop inside FastAPI, and an unauthenticated control plane. Each rejection is recorded with its reasoning — the list is part of the deliverable.
 
@@ -87,12 +89,18 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `config/account.lock` + startup assertion | ✅ |
 | `agent/` — LLM portfolio manager (`gpt-5.5`, strict structured output, deterministic fallback) | ✅ |
 | `api/` — FastAPI read + control routes, SSE, desk page | ✅ |
-| Redis chain cache · arq LLM queue | ⬜ |
+| `data/cache.py` — optional Redis chain-snapshot cache (golden round-trip test) | ✅ |
+| `strategy/ladder.py` — escalation ladder, wired into entry sizing | ✅ |
+| `clock_guard.py` — refuses to trade on host↔broker clock skew > 60s | ✅ |
 | `journal/` — session report (`python -m vigil.journal.report`), social draft | ✅ |
 | Docker Compose (`postgres` · `redis` · `migrate` · `worker` · `api`) | ✅ |
+| First-trade probes (A1/A2/A3, O-1 sign check) — staged, **run live at the next open** | 🟡 |
+| arq LLM queue | ⬜ (deferred — LLM runs inline) |
 | CI | ⬜ |
 
-Tests: 383 passing, `ruff` clean, `mypy --strict` clean, schema in sync with models.
+Tests: **504 passing, 1 deliberately skipped**, `ruff` clean, `mypy --strict` clean across 64 source
+files, schema in sync with models. A dated audit of what is verified, still open, and deferred lives in
+[`docs/AUDIT.md`](docs/AUDIT.md).
 
 ## Quick start
 
