@@ -1,0 +1,86 @@
+name: CI
+
+# Keep it to the three checks the Makefile already runs — ruff, mypy, pytest —
+# against a real Postgres, so the journal and integration tests exercise database
+# guarantees rather than skipping. Not load-bearing for any deliverable; it is the
+# green-badge signal that the suite still passes from a clean checkout.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A force-push supersedes the in-flight run for the same ref rather than paying for both.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    # The journal and integration tests assert things a mock cannot stand in for —
+    # the `orders.client_order_id` UNIQUE constraint (hard rule #9), TRUNCATE-based
+    # isolation between tests, `alembic check` drift — so CI runs a real Postgres
+    # instead of letting those tests skip. Everything else is network-free already.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vigil
+          POSTGRES_PASSWORD: vigil
+          POSTGRES_DB: vigil
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vigil"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # `db/session.py` rewrites a plain `postgresql://` URL to the asyncpg driver,
+      # and `alembic/env.py` reads the same variable — one URL feeds the migration
+      # and the suite both.
+      DATABASE_URL: postgresql://vigil:vigil@localhost:5432/vigil
+      # The Makefile's RUN prefix puts src on the path (the package is under src/,
+      # not installed); set it once here so alembic and pytest both import `vigil`.
+      PYTHONPATH: src
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # requires-python is >=3.12,<3.13; pin it rather than trusting the runner default.
+      - name: Pin the interpreter
+        run: uv python install 3.12
+
+      # Installs the dev group too (ruff, mypy, pytest, hypothesis) — uv syncs it by default.
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type-check
+        run: uv run mypy src
+
+      # Never create_all() against a real database (CLAUDE.md); the schema comes
+      # from the same Alembic migration the worker ships.
+      - name: Migrate
+        run: uv run alembic upgrade head
+
+      # The models and the migration must not drift — the desk page and every
+      # repository query trust that they agree.
+      - name: Check for schema drift
+        run: uv run alembic check
+
+      - name: Test
+        run: uv run pytest -q

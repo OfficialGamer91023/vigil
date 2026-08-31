@@ -207,10 +207,21 @@ class Broker:
         )
 
     async def submit_close(
-        self, structure: OpenStructure, limit_price: Decimal, *, reason: str
+        self,
+        structure: OpenStructure,
+        limit_price: Decimal,
+        *,
+        reason: str,
+        good_till_cancelled: bool = False,
     ) -> Order:
+        # `good_till_cancelled` is what makes a re-rested profit target a *resting*
+        # GTC exit (§2.6) rather than a day order that expires at the close; a
+        # management close stays `day`. The router already honours the flag — this
+        # only forwards it, keeping the single submit path intact (hard rule #4).
         return await asyncio.to_thread(
-            submit_close, structure, limit_price, client=self.client, reason=reason
+            submit_close, structure, limit_price,
+            client=self.client, reason=reason,
+            good_till_cancelled=good_till_cancelled,
         )
 
     async def cancel_order(self, order_id: str) -> None:

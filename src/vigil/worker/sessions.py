@@ -56,7 +56,12 @@ from vigil.control import HALT_FLAG as _HALT_FLAG
 from vigil.db.repositories import journal as J
 from vigil.db.session import get_session
 from vigil.domain import KernelDecision, OpenStructure, PortfolioState, TradeProposal
-from vigil.execution.manage import Action, ManagementDecision, sweep
+from vigil.execution.manage import (
+    Action,
+    ManagementDecision,
+    resting_target_price,
+    sweep,
+)
 from vigil.execution.pricing import closing_limit, package_mid
 from vigil.execution.reconcile import refresh_deltas, structures_missing_targets
 from vigil.execution.router import RiskKernelRejection
@@ -285,25 +290,71 @@ async def _close_structure(
 async def _replace_target(
     ctx: RunnerContext, decision: ManagementDecision, result: CycleResult
 ) -> None:
-    """Repair a §2.6 defect: an open structure with no resting exit.
+    """Repair a §2.6 defect: re-rest a resting GTC profit target that went missing.
 
-    Deliberately reported rather than silently re-submitted. Resting a *new* exit
-    requires knowing the credit the structure was opened for, and reconciliation
-    derives that from `avg_entry_price`, which the broker reports per leg and
-    which drifts from the package price we actually paid. Resting an exit at a
-    wrong price is worse than resting none: it looks repaired.
+    The router rests a target on every fill, so a healthy book never reaches here.
+    A structure without one has usually had its target cancelled out from under it
+    — a `cancel_all_orders` during a flatten that was then interrupted before the
+    close filled, or a manual cancel — and the position is now covered only by the
+    15:40 time stop and the breach rule.
 
-    The honest repair is the entry path's own guarantee — the router rests a
-    target on every fill — plus this alarm when one is missing. Wiring an
-    automatic re-rest is a Day-4 hardening task, and it belongs there rather than
-    here, half-done.
+    The earlier version only *reported* this, out of a caution that was right in
+    spirit: re-resting needs the credit the structure was opened for, and a wrong
+    price "looks repaired". `resting_target_price` answers that carefully — it
+    reproduces the entry path's own arithmetic and returns `None` when the opening
+    credit is genuinely unknown, so an adopted position we never priced still only
+    raises the alarm. When it *can* price the target we place a real GTC exit and
+    let the next reconcile read it back from the broker (§2.3: broker is truth).
     """
     s = decision.structure
-    result.warnings.append(
-        f"§2.6 DEFECT unrepaired: {s.underlying} {s.expiry} has no resting exit. "
-        f"The 15:40 time stop and the breach rule still cover it."
+    target = resting_target_price(s, ctx.strategy)
+    if target is None:
+        # No trustworthy opening credit — keep the alarm rather than guess a price.
+        result.warnings.append(
+            f"§2.6 DEFECT unrepaired: {s.underlying} {s.expiry} has no resting exit "
+            f"and no known opening credit to price one from. The 15:40 time stop and "
+            f"the breach rule still cover it."
+        )
+        log.warning(
+            "structure.no_resting_target",
+            underlying=s.underlying, expiry=str(s.expiry), reason="unknown opening credit",
+        )
+        return
+
+    try:
+        order = await ctx.broker.submit_close(
+            s, target, reason="rerest resting profit target", good_till_cancelled=True
+        )
+    except Exception as exc:  # noqa: BLE001 — a missing exit is serious; surface any failure
+        # An unclosable/unprotectable position is the worst thing in the book, so a
+        # failed re-rest is loud, not swallowed — the same stance as an unpriceable
+        # close. The time stop and breach rule remain in force meanwhile.
+        result.warnings.append(
+            f"§2.6 DEFECT unrepaired: could not re-rest a target for {s.underlying} "
+            f"{s.expiry}: {str(exc)[:120]}. The 15:40 time stop still covers it."
+        )
+        log.warning(
+            "structure.rerest_failed",
+            underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
+        )
+        return
+
+    await J.record_order(
+        ctx.db,
+        client_order_id=str(order.client_order_id),
+        broker_order_id=str(order.id),
+        intent="target",
+        limit_price=target,
+        qty=s.contracts,
+        status=str(getattr(order.status, "value", order.status)),
     )
-    log.warning("structure.no_resting_target", underlying=s.underlying, expiry=str(s.expiry))
+    result.note(
+        f"re-rested resting target for {s.underlying} {s.expiry} @ {target} (§2.6 repair)"
+    )
+    log.info(
+        "structure.rerest",
+        underlying=s.underlying, expiry=str(s.expiry), target=str(target),
+    )
 
 
 async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStructure, ...]:

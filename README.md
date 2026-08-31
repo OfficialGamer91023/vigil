@@ -94,13 +94,14 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `clock_guard.py` — refuses to trade on host↔broker clock skew > 60s | ✅ |
 | `journal/` — session report (`python -m vigil.journal.report`), social draft | ✅ |
 | Docker Compose (`postgres` · `redis` · `migrate` · `worker` · `api`) | ✅ |
+| `execution/` — mleg, ladder, router, reconcile, manage, **auto re-rest of a lost §2.6 target** | ✅ |
 | First-trade probes (A1/A2/A3, O-1 sign check) — staged, **run live at the next open** | 🟡 |
 | arq LLM queue | ⬜ (deferred — LLM runs inline) |
-| CI | ⬜ |
+| CI — GitHub Actions: `ruff` + `mypy` + `alembic check` + `pytest` on a real Postgres | ✅ |
 
-Tests: **504 passing, 1 deliberately skipped**, `ruff` clean, `mypy --strict` clean across 64 source
-files, schema in sync with models. A dated audit of what is verified, still open, and deferred lives in
-[`docs/AUDIT.md`](docs/AUDIT.md).
+Tests: **511 passing, 1 deliberately skipped**, `ruff` clean, `mypy --strict` clean across 64 source
+files, schema in sync with models — enforced on every push by [CI](.github/workflows/ci.yml). A dated
+audit of what is verified, still open, and deferred lives in [`docs/AUDIT.md`](docs/AUDIT.md).
 
 ## Quick start
 
