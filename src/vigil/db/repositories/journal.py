@@ -387,19 +387,50 @@ async def open_structure_rows(session: AsyncSession) -> list[OpenStructureRow]:
 # --------------------------------------------------------------------------- #
 
 async def record_equity(
-    session: AsyncSession, *, account_id: int, state: PortfolioState
+    session: AsyncSession,
+    *,
+    account_id: int,
+    state: PortfolioState,
+    net_dollar_delta: Decimal | None = None,
 ) -> EquitySnapshot:
-    """One point on the curve the dashboard draws and the deck quotes."""
+    """One point on the curve the dashboard draws and the deck quotes.
+
+    `net_dollar_delta` overrides the value computed from `state`. A cycle that read
+    no option chain — `manage`, `postclose` — carries every open structure at a
+    placeholder 0 delta (reconcile has no greeks), so recording `state`'s delta
+    there would zero a live exposure on the desk. Those cycles pass the last
+    refreshed value forward instead; only the entry cycle, which senses a chain,
+    records the freshly computed delta.
+    """
     row = EquitySnapshot(
         account_id=account_id,
         equity=state.equity,
         day_pnl=state.day_pnl,
         open_risk=state.open_risk,
-        net_dollar_delta=state.net_dollar_delta,
+        net_dollar_delta=(
+            state.net_dollar_delta if net_dollar_delta is None else net_dollar_delta
+        ),
     )
     session.add(row)
     await session.flush()
     return row
+
+
+async def last_net_dollar_delta(
+    session: AsyncSession, *, account_id: int
+) -> Decimal | None:
+    """The most recent snapshot's dollar-delta, to carry forward on a chain-less cycle.
+
+    `None` before the first snapshot of all — the caller then records `state`'s
+    value (0 for a flat or freshly-adopted book), which is the honest answer.
+    """
+    delta: Decimal | None = await session.scalar(
+        select(EquitySnapshot.net_dollar_delta)
+        .where(EquitySnapshot.account_id == account_id)
+        .order_by(EquitySnapshot.ts.desc())
+        .limit(1)
+    )
+    return delta
 
 
 async def peak_equity(session: AsyncSession, *, account_id: int) -> Decimal | None:

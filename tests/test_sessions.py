@@ -367,6 +367,44 @@ async def test_a_missing_target_is_re_rested_as_a_gtc_exit(no_lock):
     assert any("re-rested" in n for n in result.notes)
 
 
+async def test_a_re_rest_clears_the_defect_flag_in_the_registry(no_lock):
+    """The desk reads `has_resting_target` from the registry, so the re-rest must
+    leave it True — otherwise the dashboard reports a §2.6 defect the sweep has
+    already repaired. This is the exact stale-flag bug the live desk showed: the
+    target existed at the broker, but the journal still said MISSING.
+    """
+    structure = make_structure(
+        expiry=date.today() + timedelta(days=1), has_target=False
+    )
+    broker = StubBroker(structures=(structure,), spot=Decimal(770))
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await S.run_manage(ctx, S.CycleResult(kind=CycleKind.MANAGE))
+        rows = (
+            await db.scalars(
+                select(OpenStructureRow).where(OpenStructureRow.status == "open")
+            )
+        ).all()
+
+    assert len(rows) == 1
+    assert rows[0].has_resting_target is True, "registry still flags a repaired defect"
+
+
+async def test_manage_records_a_fresh_equity_snapshot(no_lock):
+    """The desk's equity and day-P&L must stay current through the afternoon, so a
+    manage sweep records an equity point too — not only entries and postclose,
+    which is why the desk was frozen at the last entry cycle."""
+    from vigil.db.models import EquitySnapshot
+
+    broker = StubBroker(structures=(make_structure(),), spot=Decimal(770))
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await S.run_manage(ctx, S.CycleResult(kind=CycleKind.MANAGE))
+        snaps = (await db.scalars(select(EquitySnapshot))).all()
+
+    assert len(snaps) == 1, "manage must record an equity snapshot"
+
+
 async def test_an_adopted_position_with_no_known_credit_only_warns(no_lock):
     """An adopted position we never priced has `net_credit == 0`: no honest target
     can be derived, so the repair falls back to the alarm rather than guessing."""
