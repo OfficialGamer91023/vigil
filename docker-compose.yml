@@ -44,9 +44,11 @@ services:
     image: redis:7-alpine
     ports:
       - "127.0.0.1:6379:6379"
-    # Nothing connects to Redis yet — the chain cache and the arq LLM queue are
-    # Day 3. It is here now because it makes hard rule #6 **demonstrable rather
-    # than asserted**: `docker compose stop redis` and the worker keeps trading,
+    # The worker's chain-snapshot cache (data/cache.py) now uses this, optionally:
+    # it collapses repeated ATM-chain fetches under the 200/min ceiling. The arq LLM
+    # queue is still to come. Either way Redis stays the cache, never the record — so
+    # it makes hard rule #6 **demonstrable rather than asserted**: `docker compose
+    # stop redis` and the worker keeps trading (the cache degrades to live fetches),
     # which is a claim worth being able to run on camera.
     restart: unless-stopped
 

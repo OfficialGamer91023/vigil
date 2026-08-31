@@ -30,6 +30,7 @@ from vigil.data.alpaca_client import (
     stock_data_client,
     trading_client,
 )
+from vigil.data.cache import chain_cache_key, get_snapshots, set_snapshots
 from vigil.data.greeks import ModelGreeks, solve
 from vigil.data.occ import OccSymbol, parse_occ
 
@@ -159,27 +160,55 @@ def fetch_chain(
     asof: date | None = None,
     now: datetime | None = None,
     contract_type: ContractType | None = None,
+    use_cache: bool = True,
 ) -> list[Contract]:
     """Snapshots for `underlying` within `max_dte` days and +/- `strike_window` of spot.
 
     `strike_window` is in dollars, not strikes: SPY has $1 strikes near the money,
     so +/-$12 is roughly the +/-10-strike window §1.2 prescribes, and it stays
     correct on underlyings with different strike spacing.
+
+    `use_cache` wraps only the *network* fetch of raw snapshots in the optional Redis
+    cache (§1.2): the parse + local greeks pipeline below always runs, so a cache hit
+    still models greeks against the current `now`/`spot` and never serves stale ones.
+    A miss, a down Redis, or an unset `REDIS_URL` all fall through to the live fetch —
+    the cache is an optimization, never a dependency (hard rule #6).
     """
     today = asof or today_et()
+    strike_lo = float(spot - strike_window)
+    strike_hi = float(spot + strike_window)
+    expiry_hi = today + timedelta(days=max_dte)
 
     req = OptionChainRequest(
         underlying_symbol=underlying,
         feed=OPTIONS_FEED,
-        strike_price_gte=float(spot - strike_window),
-        strike_price_lte=float(spot + strike_window),
+        strike_price_gte=strike_lo,
+        strike_price_lte=strike_hi,
         expiration_date_gte=today,
-        expiration_date_lte=today + timedelta(days=max_dte),
+        expiration_date_lte=expiry_hi,
         # None means "both rights"; the SDK omits the filter rather than sending null.
         type=contract_type,
     )
 
-    snapshots = option_data_client().get_option_chain(req)
+    cache_key = (
+        chain_cache_key(
+            underlying,
+            strike_lo=strike_lo,
+            strike_hi=strike_hi,
+            expiry_lo=today,
+            expiry_hi=expiry_hi,
+            contract_type=contract_type,
+        )
+        if use_cache
+        else None
+    )
+
+    snapshots = get_snapshots(cache_key) if cache_key is not None else None
+    if snapshots is None:
+        snapshots = option_data_client().get_option_chain(req)
+        if cache_key is not None:
+            set_snapshots(cache_key, snapshots)
+
     rate = greeks_config().risk_free_rate
 
     out: list[Contract] = []

@@ -33,6 +33,10 @@ dependencies = [
     # The ASGI server FastAPI needs to actually serve; `[standard]` brings the
     # uvloop/httptools speedups and the websocket support SSE clients negotiate.
     "uvicorn[standard]>=0.30",
+    # Optional chain-snapshot cache under the 200 req/min ceiling (PLAN §1.2). Never
+    # the record — the worker trades with Redis stopped (hard rule #6), so this is a
+    # pure passthrough optimization that falls through to a live fetch on any miss.
+    "redis>=5.0",
 ]
 
 [dependency-groups]
