@@ -406,6 +406,83 @@ async def test_market_is_empty_before_the_first_read(client, clean_db) -> None:
 
 
 @db
+async def test_state_never_shows_a_prior_sessions_equity(client, clean_db) -> None:
+    """A stack restarted mid-session onto a persisted volume must not surface the
+    *previous* day's closing equity as today's. `manage` cycles record no equity,
+    so a session that has only swept has no snapshot yet — the desk then shows
+    today's opening, never yesterday's close. This is the bug the 31 Aug desk
+    exposed: $100,000 / day P&L $0 from an Aug 28 row while the account was really
+    at ~$99,970. Without the session scoping this returns 100,000.
+    """
+    from datetime import timedelta
+
+    from vigil.db.models import EquitySnapshot
+
+    today = datetime.now(UTC).date()
+    async with get_session() as s:
+        account = await J.ensure_account(
+            s, alpaca_account_id="acct-stale", starting_equity=Decimal(100_000)
+        )
+        # Yesterday's session left a closing snapshot at $100,000.
+        prior = await J.open_session(
+            s, account_id=account.id, trading_date=today - timedelta(days=1),
+            opening_equity=Decimal(100_000),
+        )
+        await J.start_cycle(s, session_id=prior.id, kind="postclose")
+        s.add(EquitySnapshot(
+            account_id=account.id, equity=Decimal(100_000), day_pnl=Decimal(0),
+            open_risk=Decimal(0), net_dollar_delta=Decimal(0),
+            ts=datetime.now(UTC) - timedelta(days=1),
+        ))
+    # Today's session opened at a different equity and has only swept.
+    async with get_session() as s:
+        today_row = await J.open_session(
+            s, account_id=account.id, trading_date=today,
+            opening_equity=Decimal("99967.30"),
+        )
+        await J.start_cycle(s, session_id=today_row.id, kind="manage")
+
+    body = (await client.get("/api/state")).json()
+    assert Decimal(str(body["equity"])) == Decimal("99967.30"), "leaked a prior-day snapshot"
+    assert Decimal(str(body["day_pnl"])) == 0
+    assert body["as_of"][:10] == today.isoformat(), "as_of reached across the day boundary"
+
+
+@db
+async def test_market_never_shows_a_prior_sessions_read(client, clean_db) -> None:
+    """Same staleness class as equity: a persisted volume must not present the
+    previous session's spot and regime as "what the router last saw". Only
+    entry/open cycles record market snapshots, so a session that has only swept
+    shows an empty table rather than yesterday's read. Without the scoping this
+    returns the stale SPY row.
+    """
+    from datetime import timedelta
+
+    today = datetime.now(UTC).date()
+    async with get_session() as s:
+        account = await J.ensure_account(
+            s, alpaca_account_id="acct-mkt-stale", starting_equity=Decimal(100_000)
+        )
+        prior = await J.open_session(
+            s, account_id=account.id, trading_date=today - timedelta(days=1),
+            opening_equity=Decimal(100_000),
+        )
+        pc = await J.start_cycle(s, session_id=prior.id, kind="entry")
+        await J.record_market_snapshot(
+            s, cycle_id=pc.id, underlying="SPY", spot=Decimal("700.00"),
+            iv_atm=Decimal("0.20"), rv_annual=Decimal("0.15"),
+            vrp_pct=Decimal("0.55"), iv_pct=Decimal("0.40"), trend=Decimal("0.004"),
+        )
+        today_row = await J.open_session(
+            s, account_id=account.id, trading_date=today, opening_equity=Decimal(100_000),
+        )
+        await J.start_cycle(s, session_id=today_row.id, kind="manage")
+
+    body = (await client.get("/api/market")).json()
+    assert body == [], "leaked a prior session's market read"
+
+
+@db
 async def test_orders_report_every_intent_newest_first(client, clean_db) -> None:
     """Entries, resting targets and closes share one table, split by `intent`.
 
