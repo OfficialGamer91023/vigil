@@ -201,6 +201,29 @@ async def _state(ctx: RunnerContext, structures: tuple[OpenStructure, ...]) -> P
     return portfolio_state(account, structures, peak_equity=peak, halted=halted)
 
 
+async def _record_equity_carried(
+    ctx: RunnerContext, structures: tuple[OpenStructure, ...]
+) -> PortfolioState:
+    """Record a fresh equity mark for a cycle that read no chain, and return the state.
+
+    `manage` and `postclose` reconcile the book but never sense a chain, so every
+    structure carries the reconcile placeholder `dollar_delta=0`. Recording that
+    would zero the desk's portfolio delta between entries; instead the last
+    refreshed value is carried forward (see `record_equity`). Recording *equity*
+    here at all is what keeps the dashboard's equity and day-P&L current through the
+    afternoon, rather than frozen at the last entry cycle.
+    """
+    state = await _state(ctx, structures)
+    carried = (
+        await J.last_net_dollar_delta(ctx.db, account_id=ctx.account_row_id)
+        if structures else None
+    )
+    await J.record_equity(
+        ctx.db, account_id=ctx.account_row_id, state=state, net_dollar_delta=carried
+    )
+    return state
+
+
 # --------------------------------------------------------------------------- #
 # reconcile — broker truth, written back to the registry
 # --------------------------------------------------------------------------- #
@@ -348,6 +371,13 @@ async def _replace_target(
         qty=s.contracts,
         status=str(getattr(order.status, "value", order.status)),
     )
+    # Clear the §2.6 defect in the registry now, in the same cycle. `reconcile`
+    # set `has_resting_target=False` at the top of the sweep (the target really was
+    # gone), and no later cycle may run before the desk is read — so without this
+    # the dashboard reports a defect the sweep has already repaired. The next
+    # reconcile reads the broker back and confirms it (§2.3: broker is truth); this
+    # only keeps the journal honest in the interim.
+    await J.record_structure(ctx.db, replace(s, has_resting_target=True))
     result.note(
         f"re-rested resting target for {s.underlying} {s.expiry} @ {target} (§2.6 repair)"
     )
@@ -368,6 +398,7 @@ async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruc
     structures = await reconcile(ctx, result)
     if not structures:
         result.note("book is flat")
+        await _record_equity_carried(ctx, structures)
         return structures
 
     # Sorted list, not a set: `zip`ping two separately-constructed sets would
@@ -392,6 +423,10 @@ async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruc
 
     held = sum(1 for d in decisions if d.action is Action.HOLD)
     result.note(f"swept {len(decisions)} structure(s): {result.closed} closed, {held} held")
+    # Record equity after the sweep, so the desk's equity/day-P&L stay current
+    # through the afternoon instead of frozen at the last entry cycle. The re-rested
+    # targets are already reflected (see `_replace_target`); the delta is carried.
+    await _record_equity_carried(ctx, structures)
     return structures
 
 
@@ -955,8 +990,10 @@ async def flatten(ctx: RunnerContext, result: CycleResult) -> None:
 async def postclose(ctx: RunnerContext, result: CycleResult) -> None:
     """16:15 — close the books. The day's last equity reading is the scored one."""
     structures = await ctx.broker.structures()
-    state = await _state(ctx, structures)
-    await J.record_equity(ctx.db, account_id=ctx.account_row_id, state=state)
+    # Carry the last refreshed delta forward: postclose senses no chain, so the raw
+    # state's delta is a placeholder 0, and the scored closing snapshot should not
+    # report a live book as delta-flat.
+    state = await _record_equity_carried(ctx, structures)
     await J.close_session(
         ctx.db, session_id=ctx.session_row_id, closing_equity=state.equity
     )
