@@ -13,6 +13,7 @@ import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -82,22 +83,46 @@ async def state(db: Db) -> StateOut:
     snapshot = None
     session_row = None
     if account is not None:
-        snapshot = await R.latest_equity(db, account_id=account.id)
         session_row = await R.today_session(db, account_id=account.id)
+        # Scope "now" to this session, so a stack restarted onto a persisted volume
+        # can never surface yesterday's closing snapshot as today's equity.
+        snapshot = await R.latest_equity(
+            db,
+            account_id=account.id,
+            since=session_row.created_at if session_row else None,
+        )
+
+    # Equity/P&L: the latest snapshot *from this session* when there is one; else
+    # the session's opening equity (day P&L 0). `manage` cycles don't record
+    # equity, so a session that has only swept has no snapshot yet — showing its
+    # opening (a today value) beats reaching across the day boundary for a stale
+    # one. `as_of` carries the honest timestamp either way.
+    equity: Decimal | None
+    day_pnl: Decimal | None
+    net_dollar_delta: Decimal | None
+    as_of: datetime | None
+    if snapshot is not None:
+        equity, day_pnl = snapshot.equity, snapshot.day_pnl
+        net_dollar_delta, as_of = snapshot.net_dollar_delta, snapshot.ts
+    elif session_row is not None:
+        equity, day_pnl = session_row.opening_equity, Decimal(0)
+        net_dollar_delta, as_of = None, session_row.created_at
+    else:
+        equity = day_pnl = net_dollar_delta = as_of = None
 
     return StateOut(
         account_id=account.alpaca_account_id if account else None,
-        equity=snapshot.equity if snapshot else None,
-        day_pnl=snapshot.day_pnl if snapshot else None,
+        equity=equity,
+        day_pnl=day_pnl,
         # From the structures table rather than the snapshot, so an empty book
         # reports 0 even before the worker has written its first equity row.
         open_risk=await R.open_risk(db),
-        net_dollar_delta=snapshot.net_dollar_delta if snapshot else None,
+        net_dollar_delta=net_dollar_delta,
         open_structures=[StructureOut.model_validate(s) for s in structures],
         halted=flags.get(HALT_FLAG, False),
         flatten_requested=flags.get(FLATTEN_FLAG, False),
         trading_date=session_row.trading_date if session_row else None,
-        as_of=snapshot.ts if snapshot else None,
+        as_of=as_of,
     )
 
 
@@ -149,7 +174,16 @@ async def market(db: Db) -> list[MarketSnapshotOut]:
     this says what it decided *from*, per symbol, which the single `regime`
     column on a cycle cannot express when the universe holds more than one name.
     """
-    return [MarketSnapshotOut.model_validate(m) for m in await R.latest_market_snapshots(db)]
+    account = await R.the_account(db)
+    session_row = (
+        await R.today_session(db, account_id=account.id) if account is not None else None
+    )
+    return [
+        MarketSnapshotOut.model_validate(m)
+        for m in await R.latest_market_snapshots(
+            db, session_id=session_row.id if session_row else None
+        )
+    ]
 
 
 @router.get("/api/orders", response_model=list[OrderOut], tags=["read"])

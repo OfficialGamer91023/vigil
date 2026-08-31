@@ -42,20 +42,31 @@ async def the_account(session: AsyncSession) -> Account | None:
     return row
 
 
-async def latest_equity(session: AsyncSession, *, account_id: int) -> EquitySnapshot | None:
-    """The most recent equity snapshot — the API's view of "now".
+async def latest_equity(
+    session: AsyncSession, *, account_id: int, since: datetime | None = None
+) -> EquitySnapshot | None:
+    """The most recent equity snapshot, optionally within the current session.
 
     The API reads the **journal**, never the broker: a dashboard that called
     Alpaca would put the API on the trading path, which hard rule #6 forbids, and
     would burn the 200/min budget the worker needs. So "now" here means "as of the
     worker's last cycle", and `/health` reports that age so a stale number is
     visibly stale rather than quietly wrong.
+
+    `since` bounds the search to the current session's start. Without it, a stack
+    restarted mid-session onto a persisted volume surfaces the *previous* day's
+    closing snapshot as "now" — worse than intra-session staleness, because the
+    date is wrong, not merely the minute, and $100,000/day P&L $0 reads as a fresh
+    flat day rather than a stale one. `manage` cycles never record equity (only
+    entry/premarket/open/postclose do), so a session that has only swept has no
+    snapshot yet and this returns `None`; the caller falls back to the session's
+    opening equity rather than reaching back across the day boundary.
     """
+    stmt = select(EquitySnapshot).where(EquitySnapshot.account_id == account_id)
+    if since is not None:
+        stmt = stmt.where(EquitySnapshot.ts >= since)
     row: EquitySnapshot | None = await session.scalar(
-        select(EquitySnapshot)
-        .where(EquitySnapshot.account_id == account_id)
-        .order_by(EquitySnapshot.ts.desc())
-        .limit(1)
+        stmt.order_by(EquitySnapshot.ts.desc()).limit(1)
     )
     return row
 
@@ -179,8 +190,17 @@ async def open_risk(session: AsyncSession) -> Decimal:
     return Decimal(str(total or 0))
 
 
-async def latest_market_snapshots(session: AsyncSession) -> list[MarketSnapshotRow]:
+async def latest_market_snapshots(
+    session: AsyncSession, *, session_id: int | None = None
+) -> list[MarketSnapshotRow]:
     """The most recent market read **per underlying** — what the router last saw.
+
+    `session_id` scopes to the current trading session (via the snapshot's cycle).
+    Without it, a stack restarted mid-session onto a persisted volume shows the
+    *previous* session's reads — a stale spot and regime presented as "what the
+    router last saw". `manage` cycles record no market snapshot, so a session that
+    has only swept returns an empty list, and the dashboard shows an empty table
+    rather than yesterday's numbers.
 
     `DISTINCT ON` is Postgres-specific and is the reason this is one query rather
     than a window-function subquery: it keeps the first row of each `underlying`
@@ -195,11 +215,17 @@ async def latest_market_snapshots(session: AsyncSession) -> list[MarketSnapshotR
     so it is the only place the dashboard can honestly show SPY and QQQ as the
     separate reads they are.
     """
-    rows = await session.scalars(
-        select(MarketSnapshotRow)
-        .distinct(MarketSnapshotRow.underlying)
-        .order_by(MarketSnapshotRow.underlying, MarketSnapshotRow.cycle_id.desc())
+    stmt = select(MarketSnapshotRow).distinct(MarketSnapshotRow.underlying)
+    if session_id is not None:
+        # Join through the cycle to the session. `DISTINCT ON (underlying)` still
+        # keeps the newest per symbol, now only among this session's snapshots.
+        stmt = stmt.join(Cycle, Cycle.id == MarketSnapshotRow.cycle_id).where(
+            Cycle.session_id == session_id
+        )
+    stmt = stmt.order_by(
+        MarketSnapshotRow.underlying, MarketSnapshotRow.cycle_id.desc()
     )
+    rows = await session.scalars(stmt)
     return sorted(rows.all(), key=lambda r: r.underlying)
 
 
