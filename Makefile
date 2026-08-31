@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run worker api cycle flatten cli db migrate lock \
+.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run preflight worker api cycle flatten cli db migrate lock \
 	report social up down logs ps build stack-migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
@@ -41,9 +41,16 @@ vrp:
 a3:
 	$(RUN) python scripts/a3_replay.py
 
+# First-trade readiness: paper mode, account lock, clock sync, market schedule, VRP
+# seed. Run before the open — a GO here means the only remaining variable is the
+# market. Reads only; submits nothing.
+preflight:
+	$(RUN) python scripts/preflight.py
+
 # Full pipeline against a live chain: sense -> regime -> build -> gate. Submits nothing.
+# Force a structure with `--regime`, e.g.: make dry-run ARGS="SPY --regime trend_up"
 dry-run:
-	$(RUN) python scripts/dry_run.py
+	$(RUN) python scripts/dry_run.py $(ARGS)
 
 # Dry run of the mleg probe. Pass --submit yourself to actually place an order.
 smoke:

@@ -6,6 +6,13 @@ against a live chain, and prints every gate verdict — so a rejection names the
 binding gate instead of leaving the agent silently idle.
 
 Run:  make dry-run          (or: uv run python scripts/dry_run.py [SYMBOL ...])
+
+  --regime <name> forces a structure against live quotes regardless of what the
+  live classifier says, e.g. to confirm B-1 (trend → broken-wing condor clears the
+  Gate 9 floor) without waiting for a live trend day:
+      uv run python scripts/dry_run.py SPY --regime trend_up
+  Choices: chop, trend_up, trend_down, stress, cheap_vol. It forces the *build*
+  only; the kernel still judges it and nothing is ever submitted.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ from vigil.config import risk_config, strategy_config, universe_config
 from vigil.data.alpaca_client import trading_client
 from vigil.data.bars import daily_closes, prev_close_and_open, session_closes
 from vigil.data.chain import fetch_chain, fetch_open_interest, spot_price
-from vigil.domain import PortfolioState
+from vigil.domain import PortfolioState, Regime, Structure
 from vigil.risk.context import KernelContext
 from vigil.risk.kernel import evaluate
 from vigil.signals.history import rv_history
@@ -31,6 +38,20 @@ from vigil.strategy.candidates import build_for_regime
 # three scripts repeating ["SPY", "QQQ"] is three places to forget when the
 # universe changes. Pass symbols on the command line to override.
 DEFAULT_UNIVERSE = list(universe_config().primary)
+
+# The regime → structure map, mirroring `classify`'s branches. Used only by the
+# `--regime` override below, which exists to exercise a structure against live quotes
+# when the live regime is not the one under test — most usefully B-1: the trend →
+# broken-wing-condor path that must clear the Gate 9 credit floor (§4.4.2), which can
+# only be confirmed on real quotes and only builds when the market is actually
+# trending. The override forces the build; it never fakes a fill.
+_FORCED_STRUCTURE: dict[Regime, Structure] = {
+    Regime.CHOP: Structure.IRON_CONDOR,
+    Regime.STRESS: Structure.IRON_CONDOR,
+    Regime.CHEAP_VOL: Structure.LONG_STRANGLE,
+    Regime.TREND_UP: Structure.BROKEN_WING_CONDOR,
+    Regime.TREND_DOWN: Structure.BROKEN_WING_CONDOR,
+}
 
 
 def _live_portfolio() -> PortfolioState:
@@ -47,7 +68,7 @@ def _live_portfolio() -> PortfolioState:
     )
 
 
-def run(underlying: str) -> bool:
+def run(underlying: str, *, force_regime: Regime | None = None) -> bool:
     rcfg, scfg = risk_config(), strategy_config()
     print(f"\n{'=' * 72}\n{underlying}\n{'=' * 72}")
 
@@ -90,8 +111,20 @@ def run(underlying: str) -> bool:
     snap = replace(snap, iv_atm=atm.iv or 0.0)
 
     verdict = classify(snap)
+    if force_regime is not None:
+        # Override *after* a real classification so the live read is still printed
+        # for context — this is a "what would B-1 do here" probe, not a pretence that
+        # the market is trending. `replace` because RegimeVerdict is slots=True.
+        live = verdict.regime.value.upper()
+        verdict = replace(
+            verdict,
+            regime=force_regime,
+            structure=_FORCED_STRUCTURE[force_regime],
+            reason=f"FORCED via --regime {force_regime.value} (live classify: {live})",
+        )
     print(f"  spot {spot}   regime {verdict.regime.value.upper()}"
-          f"{'  [COLD START]' if verdict.cold_start else ''}")
+          f"{'  [COLD START]' if verdict.cold_start else ''}"
+          f"{'  [FORCED]' if force_regime is not None else ''}")
     print(f"  {verdict.reason}")
     if verdict.structure is None:
         print("  -> router stands down; no candidates built.")
@@ -116,7 +149,7 @@ def run(underlying: str) -> bool:
         # **Through the dispatch, never around it.** This loop used to compute
         # `is_put = structure is PUT_CREDIT_SPREAD` itself, which mapped a
         # DEBIT_SPREAD verdict onto a call credit spread — the opposite trade.
-        candidates = [build_for_regime(verdict, chain, **common)]  # type: ignore[arg-type]
+        candidates = [build_for_regime(verdict, chain, **common)]
 
         for cand in candidates:
             if cand is None:
@@ -139,13 +172,36 @@ def run(underlying: str) -> bool:
     return False
 
 
+def _parse_args(argv: list[str]) -> tuple[list[str], Regime | None]:
+    """Split argv into symbols and an optional `--regime <name>` override. A tiny
+    manual parse rather than argparse to stay consistent with the sibling probes,
+    which all read `sys.argv` directly."""
+    force_regime: Regime | None = None
+    symbols: list[str] = []
+    it = iter(argv)
+    for arg in it:
+        if arg == "--regime":
+            name = next(it, "")
+            try:
+                force_regime = Regime(name)
+            except ValueError:
+                choices = ", ".join(r.value for r in Regime)
+                raise SystemExit(f"unknown --regime {name!r}; choose one of: {choices}") from None
+        else:
+            symbols.append(arg)
+    return symbols or DEFAULT_UNIVERSE, force_regime
+
+
 def main() -> int:
-    universe = sys.argv[1:] or DEFAULT_UNIVERSE
+    universe, force_regime = _parse_args(sys.argv[1:])
     if not is_market_open():
         print(f"NOTE: market is closed ({now_et():%a %H:%M ET}). Quotes are stale; "
               f"treat every number below as indicative only.")
+    if force_regime is not None:
+        print(f"FORCING regime {force_regime.value.upper()} → "
+              f"{_FORCED_STRUCTURE[force_regime].value} on live quotes.")
 
-    approved = [run(u) for u in universe]
+    approved = [run(u, force_regime=force_regime) for u in universe]
     print(f"\n{'=' * 72}")
     if any(approved):
         print("A3: the gate stack APPROVED at least one candidate — the agent can fire.")
