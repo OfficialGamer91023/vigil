@@ -13,12 +13,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from vigil.domain import OpenStructure, Structure
+from vigil.domain import OpenStructure, PositionLeg, Structure
 from vigil.execution.manage import (
     Action,
     decide,
     is_flatten_time,
     minutes_to_close,
+    resting_target_price,
     sweep,
 )
 
@@ -217,3 +218,47 @@ def test_there_is_no_mark_based_stop() -> None:
     """
     losing = put_spread(short="750")          # short strike far from a 765 spot
     assert decide(losing, spot=Decimal("765.00"), now=at(11, 0)).action is Action.HOLD
+
+
+# --------------------------------------------------------------------------- #
+# resting_target_price — the §2.6 re-rest, priced the same way entry prices it
+# --------------------------------------------------------------------------- #
+
+def test_a_credit_spread_re_rests_at_the_50pct_target() -> None:
+    """Buy a $0.20 credit spread back for $0.10 — 50% of max profit."""
+    assert resting_target_price(put_spread()) == Decimal("0.10")
+
+
+def test_a_condor_re_rests_off_its_two_credits() -> None:
+    """A credit structure of any leg count uses the same buy-back rule."""
+    assert resting_target_price(condor()) == Decimal("0.10")
+
+
+def test_a_long_strangle_re_rests_at_a_premium_multiple() -> None:
+    """Unbounded max profit → exit at a multiple of the premium, not a fraction of
+    it. A $1.68 strangle at 2.0x rests a sell order at $3.36."""
+    assert resting_target_price(strangle()) == Decimal("3.36")
+
+
+def test_a_debit_spread_re_rests_above_what_it_paid() -> None:
+    """A debit structure sells back *above* cost: $0.40 paid on a $1 width, 50% of
+    the $0.60 max profit → 0.40 + 0.30 = $0.70."""
+    debit = OpenStructure(
+        underlying="SPY", expiry=TOMORROW,
+        strikes=(Decimal("760"), Decimal("761")),
+        max_loss=Decimal(40), dollar_delta=Decimal(0), has_resting_target=False,
+        structure=Structure.DEBIT_SPREAD, net_credit=Decimal("-0.40"), contracts=1,
+        legs=(
+            PositionLeg(symbol="SPY260827C00760000", ratio_qty=1, is_short=False),
+            PositionLeg(symbol="SPY260827C00761000", ratio_qty=1, is_short=True),
+        ),
+    )
+    assert resting_target_price(debit) == Decimal("0.70")
+
+
+def test_an_unknown_opening_credit_yields_no_target() -> None:
+    """An adopted position we never priced has net_credit == 0. No honest target
+    can be derived, so the caller keeps the §2.6 alarm rather than guessing."""
+    from dataclasses import replace
+
+    assert resting_target_price(replace(put_spread(), net_credit=Decimal(0))) is None

@@ -111,7 +111,7 @@ class StubBroker:
         self._equity = equity
         self.quotes_by_symbol = quotes or {}
         self._spot = spot
-        self.closes: list[tuple[OpenStructure, Decimal, str]] = []
+        self.closes: list[tuple[OpenStructure, Decimal, str, bool]] = []
         self.cancelled_all = False
 
     @property
@@ -140,8 +140,8 @@ class StubBroker:
         return {sym: self.quotes_by_symbol[sym] for sym in symbols
                 if sym in self.quotes_by_symbol}
 
-    async def submit_close(self, structure, limit_price, *, reason):
-        self.closes.append((structure, limit_price, reason))
+    async def submit_close(self, structure, limit_price, *, reason, good_till_cancelled=False):
+        self.closes.append((structure, limit_price, reason, good_till_cancelled))
         return StubOrder(f"vigil-cls-{structure.underlying}-{len(self.closes)}")
 
     async def cancel_all_orders(self) -> None:
@@ -336,6 +336,54 @@ async def test_a_healthy_structure_is_held(no_lock):
         await S.run_manage(ctx, result)
     assert broker.closes == []
     assert "1 held" in result.summary
+
+
+async def test_a_missing_target_is_re_rested_as_a_gtc_exit(no_lock):
+    """§2.6 repair: a structure with no resting exit gets a real GTC target back.
+
+    Not breached (spot well above the short strike) and not past the time stop, so
+    the sweep's only action is the re-rest. The submitted close must be GTC — a day
+    order would expire at the bell and leave the position unprotected overnight —
+    and journalled with `intent="target"` so the book shows the exit exists.
+    """
+    structure = make_structure(
+        expiry=date.today() + timedelta(days=1), has_target=False
+    )
+    broker = StubBroker(structures=(structure,), spot=Decimal(770))
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        orders = (await db.scalars(select(OrderRow))).all()
+
+    assert len(broker.closes) == 1
+    _, limit, reason, gtc = broker.closes[0]
+    assert gtc is True, "a re-rested profit target must be a resting GTC order"
+    assert "rerest" in reason
+    # 50% target on a $0.20 credit put credit spread → buy it back for $0.10.
+    assert limit == Decimal("0.10")
+    assert [o.intent for o in orders] == ["target"]
+    assert result.closed == 0
+    assert any("re-rested" in n for n in result.notes)
+
+
+async def test_an_adopted_position_with_no_known_credit_only_warns(no_lock):
+    """An adopted position we never priced has `net_credit == 0`: no honest target
+    can be derived, so the repair falls back to the alarm rather than guessing."""
+    from dataclasses import replace
+
+    orphan = replace(
+        make_structure(expiry=date.today() + timedelta(days=1), has_target=False),
+        net_credit=Decimal(0),
+    )
+    broker = StubBroker(structures=(orphan,), spot=Decimal(770))
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+
+    assert broker.closes == []
+    assert any("no known opening credit" in w for w in result.warnings)
 
 
 # --------------------------------------------------------------------------- #

@@ -33,7 +33,12 @@ from enum import StrEnum
 
 from vigil.clock import ET, MARKET_CLOSE
 from vigil.config import StrategyConfig, strategy_config
-from vigil.domain import OpenStructure
+from vigil.domain import OpenStructure, Structure
+from vigil.execution.pricing import (
+    debit_profit_target_price,
+    premium_multiple_target_price,
+    profit_target_price,
+)
 
 
 class Action(StrEnum):
@@ -71,6 +76,61 @@ def minutes_to_close(now: datetime) -> int:
     et = now.astimezone(ET)
     close = datetime.combine(et.date(), MARKET_CLOSE, tzinfo=ET)
     return int((close - et).total_seconds() // 60)
+
+
+def resting_target_price(
+    structure: OpenStructure, config: StrategyConfig | None = None
+) -> Decimal | None:
+    """The price to re-rest a lost profit target at (§2.6 repair), or ``None``.
+
+    Reproduces exactly the three branches ``router._rest_profit_target`` runs at
+    entry — a credit structure buys back at ``target_pct`` of its credit, a
+    long-only sleeve exits at a multiple of the premium, a debit spread sells back
+    *above* what it paid — but keyed on the structure's **reconciled** package
+    credit rather than the entry fill, because the entry ``Order`` is not what the
+    manage sweep has in front of it.
+
+    Two properties make re-resting off the reconciled credit honest rather than a
+    guess, which is what the earlier "warn only" repair was rightly cautious about:
+
+    - It rests a **closing** order. A credit a cent off the true fill can only make
+      the exit fire slightly early or slightly late; it can lower realized risk and
+      never raise it, and max loss stays bounded by Gate 2 either way.
+    - It is a **real order the next reconcile reads back from the broker**, so a
+      repair can never "look repaired" while being absent — the failure mode the
+      original docstring warned about.
+
+    Returns ``None`` — and the caller keeps the §2.6 alarm — when the opening
+    credit is unknown (``net_credit == 0``: an adopted position we never priced) or
+    the shape cannot be mapped to a target without guessing. A wrong exit is worse
+    than none; *no* exit that we admit to is better than a fabricated one.
+    """
+    cfg = config or strategy_config()
+    credit = structure.net_credit
+    if credit == 0:
+        return None
+
+    # Long-only is read from the legs, not the enum, so it stays right for any
+    # long-premium shape added later — the same derivation `TradeProposal` uses.
+    long_only = bool(structure.legs) and not any(leg.is_short for leg in structure.legs)
+    if structure.structure is Structure.LONG_STRANGLE or long_only:
+        # Max profit is unbounded, so "50% of max profit" is undefined — exit at a
+        # multiple of the premium paid instead.
+        return premium_multiple_target_price(credit, cfg.convexity_profit_target_multiple)
+
+    if credit > 0:
+        # Any credit structure — vertical or condor: buy it back at `target_pct`.
+        return profit_target_price(credit, cfg.profit_target_pct)
+
+    if structure.structure is Structure.DEBIT_SPREAD and len(structure.strikes) >= 2:
+        # A debit spread exits *above* cost. Width is the strike span; a single
+        # strike (or none) means we cannot size the target and must not guess.
+        width = max(structure.strikes) - min(structure.strikes)
+        if width <= 0:
+            return None
+        return debit_profit_target_price(credit, width, cfg.profit_target_pct)
+
+    return None
 
 
 def decide(
