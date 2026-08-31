@@ -17,6 +17,9 @@ __pycache__/
 data/raw/
 *.local.json
 
+# Auto-journal artefacts (per-session report + social draft, regenerated at post-close)
+var/
+
 # Knowledge-graph extraction output (generated, ~3MB, regenerated on demand)
 graphify-out/
 

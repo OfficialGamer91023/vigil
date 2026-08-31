@@ -60,6 +60,7 @@ from vigil.execution.manage import Action, ManagementDecision, sweep
 from vigil.execution.pricing import closing_limit, package_mid
 from vigil.execution.reconcile import refresh_deltas, structures_missing_targets
 from vigil.execution.router import RiskKernelRejection
+from vigil.journal.emit import emit_session_journal
 from vigil.logging import get_logger
 from vigil.risk.context import KernelContext
 from vigil.risk.kernel import evaluate
@@ -917,6 +918,26 @@ async def postclose(ctx: RunnerContext, result: CycleResult) -> None:
             f"{len(structures)} position(s) held overnight — expected only for "
             f"expiries beyond today"
         )
+
+    # Auto-journal: produce the day's report + build-in-public draft so the
+    # competition deliverable exists without a human running the CLI. Best-effort by
+    # design — the books are already closed above; narrating them must not be able to
+    # undo that, so a failure here logs and is noted, never raised. This is the same
+    # "a close we cannot journal is still a close" rule that governs the whole cycle.
+    try:
+        journalled = await emit_session_journal(ctx.db)
+    except Exception as exc:  # noqa: BLE001 — journaling is never worth failing close for
+        log.warning("postclose.journal_failed", error=str(exc)[:200])
+        result.warnings.append(f"auto-journal failed: {type(exc).__name__}")
+    else:
+        if journalled is not None:
+            source = (
+                "template" if journalled.draft.fell_back else journalled.draft.model
+            )
+            result.note(
+                f"journalled report + social draft ({source}) → "
+                f"{journalled.report_path.name}, {journalled.social_path.name}"
+            )
 
 
 def _opt_dec(value: float | None) -> Decimal | None:
