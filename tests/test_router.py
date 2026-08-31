@@ -58,14 +58,19 @@ class FakeTradingClient:
         self.seen_ids.add(coid)
 
     def _order_for(self, n: int, order_id: str) -> FakeOrder:
+        # A credit package fills at a **negative** `filled_avg_price` — the real
+        # broker convention measured live 31 Aug (O-1). The fixtures here are all
+        # credit structures, so the fill is -0.20; using +0.20 (as this fake once
+        # did) is what let the target-sign bug pass every test. The router must take
+        # `abs` before pricing the resting target.
         if self.partial_qty is not None and n == (self.fill_on_rung or 1):
             return FakeOrder(id=order_id, status="partially_filled",
-                             filled_avg_price="0.20", filled_qty=str(self.partial_qty))
+                             filled_avg_price="-0.20", filled_qty=str(self.partial_qty))
         filled = self.fill_on_rung is not None and n == self.fill_on_rung
         return FakeOrder(
             id=order_id,
             status="filled" if filled else "new",
-            filled_avg_price="0.20" if filled else None,
+            filled_avg_price="-0.20" if filled else None,
             filled_qty="8" if filled else "0",
         )
 
@@ -137,7 +142,9 @@ def test_the_target_price_is_derived_from_the_actual_fill(
     """Not from the proposal — a partial or improved fill changes the target."""
     client = FakeTradingClient(fill_on_rung=1)
     submit_entry(put_credit_spread, flat_book, ctx, client=client, sleep=_noop_sleep)
-    # Filled at $0.20; 50% target means buying it back at $0.10.
+    # Filled at a -0.20 credit (broker's sign, O-1); 50% target means buying it back
+    # at $0.10. The router must `abs` the fill first — a negative here would clamp the
+    # target to the 0.01 tick floor, which is the bug this test now guards.
     assert client.submitted[1].limit_price == 0.10
 
 

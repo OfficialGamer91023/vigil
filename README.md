@@ -95,7 +95,7 @@ Deliberately **rejected**: LangChain/LangGraph, the OpenAI Agents SDK, index opt
 | `journal/` — session report (`python -m vigil.journal.report`), social draft | ✅ |
 | Docker Compose (`postgres` · `redis` · `migrate` · `worker` · `api`) | ✅ |
 | `execution/` — mleg, ladder, router, reconcile, manage, **auto re-rest of a lost §2.6 target** | ✅ |
-| First-trade probes (A1/A2/A3, O-1 sign check) — staged, **run live at the next open** | 🟡 |
+| First-trade probes (A1/A2/A3, O-1 sign check) — **run live 31 Aug**; agent placed its first kernel-gated trade | ✅ |
 | arq LLM queue | ⬜ (deferred — LLM runs inline) |
 | CI — GitHub Actions: `ruff` + `mypy` + `alembic check` + `pytest` on a real Postgres | ✅ |
 

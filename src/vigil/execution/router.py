@@ -230,8 +230,17 @@ def _rest_profit_target(
     `contracts` carries the *actual* filled quantity, which on a partial is less
     than the proposal asked for.
     """
+    # `abs`, because the broker reports a credit fill as a **negative**
+    # `filled_avg_price` — measured live 31 Aug (O-1, docs/CLI_NOTES.md §1): a
+    # package submitted for a +0.27 credit fills at -0.27. The target formulas below
+    # all expect a positive credit/debit *magnitude* (the fallback already takes
+    # `abs`). Without this, `profit_target_price(-0.27, 0.5)` yields a negative
+    # remaining that clamps to the 0.01 tick floor — a resting "target" that is pure
+    # decoration and never fills, so every credit trade rides to the 15:40 time stop
+    # instead of taking 50%. Safe for debits too: they fill positive, so `abs` is a
+    # no-op there.
     filled_price = (
-        Decimal(str(entry.filled_avg_price))
+        abs(Decimal(str(entry.filled_avg_price)))
         if entry.filled_avg_price
         else abs(proposal.net_credit)
     )
