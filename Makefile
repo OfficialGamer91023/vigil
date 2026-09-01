@@ -1,5 +1,5 @@
 # Vigil — Day -1 targets only. Compose/migrate/CI arrive Day 0 (PLAN §11).
-.PHONY: setup lint test measure a1 a2 a3 vrp smoke dry-run preflight worker api cycle flatten cli db migrate lock \
+.PHONY: setup lint test test-db measure a1 a2 a3 vrp smoke dry-run preflight worker api cycle flatten cli db migrate lock \
 	report social up down logs ps build stack-migrate clean
 
 # --- The macOS .pth trap ----------------------------------------------------
@@ -19,8 +19,24 @@ setup:
 lint:
 	$(RUN) ruff check . && $(RUN) mypy src
 
+# The DB-backed tests TRUNCATE every journal table, so they must never touch the
+# live desk database — conftest refuses any database whose name does not end in
+# `_test`. `test` targets vigil_test explicitly (belt to conftest's default); run
+# `make test-db` once to create and migrate it. Without a reachable vigil_test the
+# DB tests just skip, so `make test` still runs the network-free suite anywhere.
+TEST_DATABASE_URL ?= postgresql://localhost/vigil_test
+
 test:
-	$(RUN) pytest -q
+	DATABASE_URL=$(TEST_DATABASE_URL) $(RUN) pytest -q
+
+# Provision the disposable test database: create it if missing, then bring its
+# schema to head via Alembic (never create_all against a real database, CLAUDE.md).
+# Separate from `test` so `make test` needs no native Postgres for the unit suite.
+test-db:
+	@psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='vigil_test'" | grep -q 1 \
+		|| createdb vigil_test
+	@DATABASE_URL=$(TEST_DATABASE_URL) $(RUN) alembic upgrade head
+	@echo "test database ready: vigil_test"
 
 # --- Day -1: measure the three load-bearing assumptions (PLAN §1.3) ----------
 measure: a1 a2 vrp a3
