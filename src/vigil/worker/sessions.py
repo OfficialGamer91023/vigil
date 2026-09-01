@@ -63,7 +63,11 @@ from vigil.execution.manage import (
     sweep,
 )
 from vigil.execution.pricing import closing_limit, package_mid
-from vigil.execution.reconcile import refresh_deltas, structures_missing_targets
+from vigil.execution.reconcile import (
+    RestingOrder,
+    refresh_deltas,
+    structures_missing_targets,
+)
 from vigil.execution.router import RiskKernelRejection
 from vigil.journal.emit import emit_session_journal
 from vigil.logging import get_logger
@@ -102,6 +106,29 @@ _CANCEL_SETTLE_PAUSE = 0.25  # seconds between polls
 # separately because it means the structure is already gone.
 _TARGET_FREED = frozenset({"canceled", "expired", "rejected"})
 
+# After submitting a management close, poll it briefly toward a confirmed fill
+# before booking the structure closed (§2.3). A paper broker fills a marketable
+# limit synchronously, so the first read (taken with no pause) usually settles it;
+# the budget is small because this is a best-effort *confirmation*, not a safety
+# gate like the cancel-settle poll, and an unconfirmed close is safely retired by
+# the next reconcile finding the position absent rather than by waiting here.
+_CLOSE_FILL_ATTEMPTS = 3
+_CLOSE_FILL_PAUSE = 0.25  # seconds between polls
+
+# A submitted close that reaches one of these has terminated *without* filling —
+# something else (an operator, an expiry, a broker reject) killed it. The structure
+# stays open and is retried next sweep; it must not be booked closed. `filled` is,
+# again, handled separately: it is the one terminal state that did close it.
+_CLOSE_UNFILLED = frozenset({"canceled", "expired", "rejected", "done_for_day"})
+
+# How far a still-resting management close must have drifted from the price we would
+# submit *now* before it is worth cancelling and repricing. Below this, the resting
+# close is left to fill — cancelling and re-submitting it every five minutes is the
+# churn that rode a breached 0DTE into auto-exercise. 5% of the package value is
+# comfortably inside one option tick on the structures this agent trades, so a close
+# is repriced only on a real move against it, never on quote jitter.
+_CLOSE_REPRICE_DRIFT = Decimal("0.05")
+
 
 @dataclass(slots=True)
 class CycleResult:
@@ -121,6 +148,14 @@ class CycleResult:
     approved: int = 0
     submitted: int = 0
     closed: int = 0
+    # Structures whose close was *submitted* this cycle but not yet confirmed
+    # filled — a limit order resting at the broker (hard rule #5 forbids the market
+    # order that would make it instant). Kept apart from `closed` on purpose: a
+    # structure is only `closed` once the broker confirms the fill or the next
+    # reconcile finds the position gone (§2.3), so conflating the two is exactly the
+    # phantom-close bug this counter exists to make visible. In-memory only; it
+    # rides the cycle's `notes` summary, so no schema column is needed.
+    closing: int = 0
     warnings: list[str] = field(default_factory=list)
 
     def note(self, message: str) -> None:
@@ -311,6 +346,72 @@ async def _await_target_settled(ctx: RunnerContext, order_id: str) -> str:
     return "deferred"
 
 
+async def _await_close_filled(ctx: RunnerContext, order_id: str) -> str:
+    """Poll a just-submitted management close toward a terminal fill. Bounded.
+
+    Returns one of:
+      * ``"filled"``  — the close filled; the position is really gone, so the
+        structure may be booked closed now. This is the *confirmed terminal fill*
+        transition §2.3 asks for, the one the old fire-and-forget path skipped.
+      * ``"working"`` — still live (``new``/``accepted``/``pending_*``/
+        ``partially_filled``) after the budget. The close is resting at the broker
+        and the structure is **closing in flight** — deliberately *not* booked
+        closed here. The next reconcile books it once the position is actually
+        absent (the 0-open-quantity transition), so a limit that fills a minute
+        later is not mistaken for one that never will.
+      * ``"gone"``    — reached a terminal non-fill state; the close will not
+        complete, so the structure stays open and is retried next sweep.
+
+    Same shape as `_await_target_settled`: the first read takes no pause, so a paper
+    broker that fills synchronously settles on attempt zero, and a pause is taken
+    only *between* reads.
+    """
+    for attempt in range(_CLOSE_FILL_ATTEMPTS):
+        status = await ctx.broker.order_status(order_id)
+        if status == "filled":
+            return "filled"
+        if status in _CLOSE_UNFILLED:
+            return "gone"
+        if attempt + 1 < _CLOSE_FILL_ATTEMPTS:
+            await asyncio.sleep(_CLOSE_FILL_PAUSE)
+    return "working"
+
+
+def _is_management_close(order: RestingOrder) -> bool:
+    """A closing order that is *ours in flight* rather than a §2.6 profit target.
+
+    The router rests the profit target `gtc` (`test_router` pins this) and submits
+    a management close `day`. So among the closing orders covering a structure's
+    legs, the `day` one is the close a previous sweep already sent — the order to
+    leave alone, not to cancel and reprice. A closing order with no known TIF (a
+    test fixture, or an adopted ticket the feed did not tag) is treated as a target
+    to cancel, which is the pre-fix behaviour and the safe default: freeing legs
+    never strands a position, whereas leaving an unknown order in place might.
+    """
+    return order.is_closing and order.tif.lower() == "day"
+
+
+def _close_has_drifted(
+    fresh: Decimal, working: Decimal | None, package_value: Decimal
+) -> bool:
+    """Has the market moved enough that a resting close no longer fills?
+
+    `fresh` is the limit we would submit now; `working` is the resting close's own
+    limit. Direction matters and is read from the package sign, exactly as
+    `closing_limit` does: buying a package back, a *higher* limit is the aggressive
+    one, so the resting close has drifted only if we now need to pay materially
+    more than it offers; selling one back, it is the reverse. A close with no known
+    limit (`None`) is left alone — we cannot compare, and churning it is the disease
+    being cured, not the cure.
+    """
+    if working is None or working <= 0:
+        return False
+    tol = _CLOSE_REPRICE_DRIFT
+    if package_value >= 0:
+        return fresh > working * (Decimal(1) + tol)
+    return fresh < working * (Decimal(1) - tol)
+
+
 async def _close_structure(
     ctx: RunnerContext, decision: ManagementDecision, result: CycleResult
 ) -> bool:
@@ -337,18 +438,83 @@ async def _close_structure(
     value = package_mid([(*quotes[leg.symbol], leg.is_short) for leg in s.legs])
     limit = closing_limit(value)
 
-    # The resting GTC profit target this structure carries (§2.6) reserves its leg
-    # quantity at the broker (`held_for_orders`), so a close submitted against the
-    # same legs is rejected for insufficient available quantity — the failure that
-    # was tearing down the whole manage cycle every sweep. Cancel the structure's
-    # own resting exit first to free the contracts, scoped by leg symbols so a
-    # sibling structure's target is untouched. The 15:40 flatten does the same thing
-    # wholesale (`cancel_all_orders` → close); this is the per-structure version.
+    # Partition the closing orders that cover exactly these legs. Two live on the
+    # same legs and `is_closing` cannot tell them apart, yet they want opposite
+    # treatment (see `RestingOrder`): the §2.6 profit target (`gtc`) reserves the
+    # leg quantity at the broker (`held_for_orders`) and must be cancelled before a
+    # close can price against them; a working management close (`day`) is the close
+    # a previous sweep already sent and must be **left to fill**. Cancelling and
+    # re-pricing that working close every five minutes is the churn that "closed"
+    # QQQ two dozen times and rode it into auto-exercise. Scoped by leg symbols so a
+    # sibling structure's orders are untouched.
     leg_symbols = set(symbols)
     try:
-        for r in await ctx.broker.resting_orders():
-            if not (r.is_closing and leg_symbols <= r.symbols):
-                continue
+        covering = [
+            r for r in await ctx.broker.resting_orders()
+            if r.is_closing and leg_symbols <= r.symbols
+        ]
+        working = next((r for r in covering if _is_management_close(r)), None)
+        targets = [r for r in covering if not _is_management_close(r)]
+
+        if working is not None:
+            if not _close_has_drifted(limit, working.limit_price, value):
+                # The close we sent last sweep is still resting and still priced to
+                # fill. Do nothing that could cancel or double it: the structure is
+                # closing in flight, and the next reconcile books it closed once the
+                # position is actually gone (§2.3). This is the anti-churn path — the
+                # one whose absence let a breached 0DTE be "closed" every cycle while
+                # never leaving the book.
+                result.closing += 1
+                result.note(
+                    f"{s.underlying} {s.expiry} already closing — order "
+                    f"{working.order_id[:8]} working @ {working.limit_price}; "
+                    f"awaiting fill, not resubmitting"
+                )
+                log.info(
+                    "structure.close_in_flight",
+                    underlying=s.underlying, expiry=str(s.expiry),
+                    order_id=working.order_id, resting_limit=str(working.limit_price),
+                )
+                return True
+            # The market has moved enough that the resting close no longer fills.
+            # Cancel it (waiting the async cancel out so its legs are freed) and fall
+            # through to reprice — the one case where replacing a working close is
+            # right rather than churn.
+            await ctx.broker.cancel_order(working.order_id)
+            settled = await _await_target_settled(ctx, working.order_id)
+            if settled == "filled":
+                # It filled while we were repricing — already closed. Book it and stop.
+                await J.close_structure(
+                    ctx.db, underlying=s.underlying, expiry=s.expiry,
+                    reason=f"working close filled ahead of reprice for {decision.reason}",
+                )
+                result.closed += 1
+                result.note(
+                    f"{s.underlying} {s.expiry} closed by its working close "
+                    f"{working.order_id[:8]} before it could be repriced"
+                )
+                log.info(
+                    "structure.close_filled_during_reprice",
+                    underlying=s.underlying, expiry=str(s.expiry), order_id=working.order_id,
+                )
+                return True
+            if settled == "deferred":
+                result.warnings.append(
+                    f"CLOSE DEFERRED {s.underlying} {s.expiry}: working close "
+                    f"{working.order_id[:8]} did not settle after cancel; not repriced "
+                    f"this cycle. The 15:40 flatten and breach rule still cover it."
+                )
+                log.warning(
+                    "structure.reprice_deferred",
+                    underlying=s.underlying, expiry=str(s.expiry), order_id=working.order_id,
+                )
+                return False
+            result.note(
+                f"repriced stale close on {s.underlying} {s.expiry} "
+                f"({working.limit_price} → {limit})"
+            )
+
+        for r in targets:
             await ctx.broker.cancel_order(r.order_id)
             # A cancel is only a *request*: the target sits in `pending_cancel`
             # with its legs still reserved until the broker settles it, so submitting
@@ -425,13 +591,54 @@ async def _close_structure(
         qty=s.contracts,
         status=str(getattr(order.status, "value", order.status)),
     )
-    await J.close_structure(
-        ctx.db, underlying=s.underlying, expiry=s.expiry, reason=decision.reason
+
+    # Confirm the fill before booking the structure closed (§2.3). A close is a
+    # *limit* order, not a fill (hard rule #5 forbids the market order that would
+    # make it instant), so marking the structure closed here on submission — the old
+    # behaviour — was a lie the moment the limit did not fill: `reconcile` rebuilds
+    # the book from broker positions, so the position it could not see closed came
+    # straight back next sweep, and the structure was "closed" again, and again. Only
+    # a broker-confirmed `filled` retires it here; an order still working stays open
+    # and is retired by a later reconcile finding the position gone.
+    outcome = await _await_close_filled(ctx, str(order.id))
+    if outcome == "filled":
+        await J.close_structure(
+            ctx.db, underlying=s.underlying, expiry=s.expiry, reason=decision.reason
+        )
+        result.closed += 1
+        result.note(f"closed {s.underlying} {s.expiry} @ {limit} — {decision.reason}")
+        log.info(
+            "structure.close", underlying=s.underlying, expiry=str(s.expiry),
+            limit=str(limit), action=decision.action.value, reason=decision.reason,
+        )
+        return True
+    if outcome == "gone":
+        # Terminal without filling — an operator cancel, an expiry, a broker reject.
+        # The structure is *not* closed; leave it open and retry next sweep. Loud,
+        # because a close that will not complete is the thing the sweep exists to
+        # prevent riding into auto-exercise.
+        result.warnings.append(
+            f"CLOSE UNFILLED {s.underlying} {s.expiry}: submitted @ {limit} but the "
+            f"order reached a terminal state without filling. Not booked closed; "
+            f"retried next sweep. The 15:40 flatten and breach rule still cover it."
+        )
+        log.warning(
+            "structure.close_unfilled",
+            underlying=s.underlying, expiry=str(s.expiry), limit=str(limit),
+        )
+        return False
+    # outcome == "working": the close is resting at the broker, closing in flight.
+    # Not an error and not a completed close — the honest state is "asked, awaiting
+    # fill", the same distinction the requested-flatten flag draws. The next sweep
+    # sees this working close and leaves it be (the anti-churn path above); the next
+    # reconcile books the structure closed once the position is gone.
+    result.closing += 1
+    result.note(
+        f"close submitted for {s.underlying} {s.expiry} @ {limit} — {decision.reason}; "
+        f"order working, structure stays open until the fill confirms (§2.3)"
     )
-    result.closed += 1
-    result.note(f"closed {s.underlying} {s.expiry} @ {limit} — {decision.reason}")
     log.info(
-        "structure.close", underlying=s.underlying, expiry=str(s.expiry),
+        "structure.close_submitted", underlying=s.underlying, expiry=str(s.expiry),
         limit=str(limit), action=decision.action.value, reason=decision.reason,
     )
     return True
@@ -566,7 +773,14 @@ async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruc
             )
 
     held = sum(1 for d in decisions if d.action is Action.HOLD)
-    result.note(f"swept {len(decisions)} structure(s): {result.closed} closed, {held} held")
+    # `closing` is called out separately from `closed`: a submitted-but-unconfirmed
+    # close is not a closed structure (§2.3), and folding it into `closed` is exactly
+    # the phantom this fix removes. Omitted when zero so the healthy line stays terse.
+    closing = f", {result.closing} closing" if result.closing else ""
+    result.note(
+        f"swept {len(decisions)} structure(s): {result.closed} closed{closing}, "
+        f"{held} held"
+    )
     # Record equity after the sweep, so the desk's equity/day-P&L stay current
     # through the afternoon instead of frozen at the last entry cycle. The re-rested
     # targets are already reflected (see `_replace_target`); the delta is carried.
