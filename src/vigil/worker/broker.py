@@ -142,6 +142,17 @@ class Broker:
         raw = await asyncio.to_thread(self.client.get_orders, req)
         return [_model(o) for o in raw]
 
+    async def resting_orders(self) -> list[RestingOrder]:
+        """The working orders at the broker, reduced to what the close path needs.
+
+        Same reduction `structures()` uses for its resting-target flag (`_as_resting`),
+        exposed on its own so `_close_structure` can find and cancel a structure's
+        resting GTC target before submitting a competing close — the target reserves
+        the leg quantity (`held_for_orders`), and an uncancelled one makes the close
+        fail for insufficient available quantity.
+        """
+        return [_as_resting(o) for o in await self.open_orders()]
+
     async def structures(self) -> tuple[OpenStructure, ...]:
         """Rebuild the book from broker truth, with resting-target flags attached.
 
