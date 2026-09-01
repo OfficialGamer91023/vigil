@@ -12,6 +12,7 @@ module-level helpers below are plain functions and may be imported directly.
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Protocol
@@ -32,6 +33,77 @@ DEFAULT_EXPIRY = date(2026, 8, 27)
 # 11:00 ET on a Wednesday: inside regular hours, past the opening window, well
 # before the closing window. Chosen so Gate 11 is never the accidental failure.
 DEFAULT_NOW = datetime(2026, 8, 26, 11, 0, tzinfo=ET)
+
+
+# --------------------------------------------------------------------------- #
+# Database safety — refuse to TRUNCATE anything but a dedicated test database
+# --------------------------------------------------------------------------- #
+#
+# The DB-backed tests empty every journal table on the way in (`truncate_journal`)
+# and once more when the run ends (`pytest_sessionfinish`). Pointed at the live desk
+# database that is not a nuisance, it is data loss: on 2026-09-01 a verification run
+# with DATABASE_URL aimed at the worker's Postgres wiped real trading history. So the
+# suite runs *only* against a database whose name marks it disposable (ends in
+# `_test`) and refuses everything else — a positive allowlist that fails closed, so
+# an unrecognised database is treated as production, never the other way round.
+
+_TEST_DB_URL = "postgresql+asyncpg://localhost/vigil_test"
+_ALLOW_UNSAFE_DB_ENV = "VIGIL_TEST_ALLOW_UNSAFE_DB"
+
+
+def _db_name(url: str) -> str:
+    from urllib.parse import urlparse
+
+    return urlparse(url).path.lstrip("/")
+
+
+def _database_is_disposable(url: str) -> bool:
+    """Whether it is safe to TRUNCATE this database in the test suite.
+
+    Safe means the name ends in `_test`, or the operator has set an explicit escape
+    hatch. Everything else — including the production `vigil` database, whatever port
+    it is on — is refused.
+    """
+    if os.environ.get(_ALLOW_UNSAFE_DB_ENV) == "1":
+        return True
+    return _db_name(url).endswith("_test")
+
+
+def pytest_configure(config: object) -> None:
+    """Abort the whole run *before* collection if the target DB is not disposable.
+
+    Defaulting `DATABASE_URL` to `vigil_test` first keeps the common case (nothing
+    set) safe with no ceremony; the guard then only ever fires when the suite has
+    been pointed explicitly at a real database — the exact mistake worth stopping
+    loudly, before a single table is truncated. This runs at one chokepoint so every
+    TRUNCATE path (the per-file autouse fixtures and `pytest_sessionfinish`) is
+    covered by it, not each independently.
+    """
+    os.environ.setdefault("DATABASE_URL", _TEST_DB_URL)
+
+    from vigil.db.session import database_url
+
+    url = database_url()
+    if _database_is_disposable(url):
+        return
+
+    name = _db_name(url)
+    looks_live = ":5433" in os.environ.get("DATABASE_URL", "") or name == "vigil"
+    warning = (
+        "  This is the LIVE desk database — running the suite here TRUNCATES every\n"
+        "  journal table and destroys real trading history.\n"
+        if looks_live
+        else ""
+    )
+    raise pytest.UsageError(
+        f"Refusing to run the destructive DB test suite against database {name!r}.\n"
+        f"{warning}"
+        f"  The suite only runs against a disposable database whose name ends in "
+        f"'_test'.\n"
+        f"  Use `make test` (targets vigil_test), or set DATABASE_URL to e.g. "
+        f"{_TEST_DB_URL}.\n"
+        f"  To override deliberately, set {_ALLOW_UNSAFE_DB_ENV}=1."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -283,6 +355,16 @@ async def truncate_journal(session: object) -> None:
     from sqlalchemy import text
 
     from vigil.db.models import Base
+    from vigil.db.session import database_url
+
+    # Defence in depth: `pytest_configure` already aborts the run against a
+    # non-test database, but this is the function that actually destroys rows, so
+    # it re-checks rather than trust that the guard ran (a stray direct import, a
+    # future entry point that skips configure).
+    assert _database_is_disposable(database_url()), (
+        f"truncate_journal refused: {_db_name(database_url())!r} is not a test "
+        f"database (name must end in '_test')"
+    )
 
     names = ", ".join(
         t.name for t in Base.metadata.sorted_tables if t.name != "alembic_version"
@@ -330,6 +412,11 @@ def pytest_sessionfinish(session: object, exitstatus: object) -> None:
 
     cached_engine.cache_clear()
     cached_factory.cache_clear()
+
+    # Same allowlist as the fixtures: never TRUNCATE a database this suite does not
+    # own, even in end-of-run cleanup. Normally unreachable (configure aborts first).
+    if not _database_is_disposable(database_url()):
+        return
 
     names = ", ".join(
         t.name for t in Base.metadata.sorted_tables if t.name != "alembic_version"
