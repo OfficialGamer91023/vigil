@@ -278,8 +278,18 @@ def _as_resting(order: Order) -> RestingOrder:
     if not intents:
         intents = [str(getattr(order, "position_intent", "") or "")]
     is_closing = any("close" in intent.lower() for intent in intents)
+    # TIF and limit distinguish a resting §2.6 profit target (`gtc`) from a working
+    # management close (`day`) on the same legs, and let the close path decide
+    # whether a still-resting close has drifted enough to reprice — see
+    # `sessions._close_structure`. The SDK carries TIF as an enum and the limit as a
+    # string; reduce both to the plain types the pure close logic compares against,
+    # never a float (see `_dec`).
+    tif = str(getattr(order.time_in_force, "value", order.time_in_force) or "").lower()
+    raw_limit = getattr(order, "limit_price", None)
+    limit_price = _dec(raw_limit) if raw_limit is not None else None
     return RestingOrder(
-        order_id=str(order.id), symbols=frozenset(symbols), is_closing=is_closing
+        order_id=str(order.id), symbols=frozenset(symbols), is_closing=is_closing,
+        tif=tif, limit_price=limit_price,
     )
 
 

@@ -110,6 +110,7 @@ class StubBroker:
         resting: list[RestingOrder] | None = None,
         close_error: bool = False,
         target_settle: str = "canceled",
+        close_fill: str = "filled",
     ) -> None:
         self._structures = structures
         self._equity = equity
@@ -133,6 +134,21 @@ class StubBroker:
         #   "pending"  — never settles; the close must defer rather than hang.
         self._target_settle = target_settle
         self.status_polls: list[str] = []
+        # How a *submitted management close* polls back (`_await_close_filled`), kept
+        # apart from `target_settle` (the cancelled §2.6 target's settle) because a
+        # close and a target-cancel are polled for different things:
+        #   "filled"  — the close fills at once, the healthy paper default; the
+        #               structure is booked closed this cycle.
+        #   "working" — the limit rests unfilled; the structure is *closing in
+        #               flight*, not closed, and must not be resubmitted next sweep.
+        #   "rejected"— the close terminates without filling; the structure stays
+        #               open and is retried.
+        self._close_fill = close_fill
+        # Close-order ids the broker has handed back, so `order_status` can tell a
+        # close poll from a target-cancel poll and record them on separate lists —
+        # keeping the existing `status_polls` assertions about target cancels intact.
+        self._close_order_ids: set[str] = set()
+        self.close_polls: list[str] = []
 
     @property
     def client(self):
@@ -173,7 +189,15 @@ class StubBroker:
             self._resting = [r for r in self._resting if r.order_id != order_id]
 
     async def order_status(self, order_id: str) -> str:
-        # The status the close's bounded poll reads back after cancelling a target.
+        # Two callers poll this: `_await_target_settled` (a cancelled §2.6 target)
+        # and `_await_close_filled` (a submitted management close). They read
+        # different states, so answer from the matching fixture and record the poll
+        # on the matching list — the close poll must not disturb `status_polls`,
+        # which existing tests assert holds only the target-cancel polls.
+        if order_id in self._close_order_ids:
+            self.close_polls.append(order_id)
+            return {"filled": "filled", "working": "accepted",
+                    "rejected": "rejected"}[self._close_fill]
         self.status_polls.append(order_id)
         return {"canceled": "canceled", "filled": "filled",
                 "pending": "pending_cancel"}[self._target_settle]
@@ -188,7 +212,22 @@ class StubBroker:
         if any(r.is_closing and leg_symbols <= r.symbols for r in self._resting):
             raise RuntimeError("insufficient qty available for order (held_for_orders)")
         self.closes.append((structure, limit_price, reason, good_till_cancelled))
-        return StubOrder(f"vigil-cls-{structure.underlying}-{len(self.closes)}")
+        order = StubOrder(f"vigil-cls-{structure.underlying}-{len(self.closes)}")
+        self._close_order_ids.add(order.id)
+        # A close that does not fill at once rests at the broker as a `day` closing
+        # order — exactly what a later sweep must recognise and leave alone rather
+        # than cancel and reprice. Model that so a second `run_manage` sees it.
+        if self._close_fill != "filled":
+            self._resting.append(
+                RestingOrder(
+                    order_id=order.id,
+                    symbols=frozenset(leg.symbol for leg in structure.legs),
+                    is_closing=True,
+                    tif="day",
+                    limit_price=Decimal(str(limit_price)),
+                )
+            )
+        return order
 
     async def cancel_all_orders(self) -> None:
         self.cancelled_all = True
@@ -222,11 +261,28 @@ def make_structure(
 
 def resting_for(structure: OpenStructure) -> RestingOrder:
     """A live resting *closing* order covering exactly this structure's legs — the
-    §2.6 profit target the router places on every fill."""
+    §2.6 profit target the router places on every fill. `gtc`, so the close path
+    cancels it to free the legs (unlike a `day` management close, which it leaves)."""
     return RestingOrder(
         order_id=f"rest-{structure.underlying}",
         symbols=frozenset(leg.symbol for leg in structure.legs),
         is_closing=True,
+        tif="gtc",
+    )
+
+
+def working_close_for(structure: OpenStructure, limit: Decimal) -> RestingOrder:
+    """A management close from a previous sweep, still resting at the broker (`day`).
+
+    This is the order the churn bug cancelled and re-priced every five minutes. The
+    close path must recognise it by its TIF and leave it to fill unless it has
+    drifted — the opposite treatment from the `gtc` profit target above."""
+    return RestingOrder(
+        order_id=f"cls-{structure.underlying}",
+        symbols=frozenset(leg.symbol for leg in structure.legs),
+        is_closing=True,
+        tif="day",
+        limit_price=limit,
     )
 
 
@@ -547,6 +603,120 @@ async def test_an_unpriceable_leg_blocks_the_close_loudly(no_lock, monkeypatch):
     assert broker.closes == []
     assert any("CANNOT PRICE" in w for w in result.warnings)
     assert result.closed == 0
+
+
+async def test_an_unfilled_close_leaves_the_structure_closing_not_closed(
+    no_lock, monkeypatch
+):
+    """The phantom-close fix, pinned. A breached structure's close is submitted but
+    the limit does not fill (hard rule #5 forbids the market order that would make it
+    instant). The old path booked the structure `closed` on *submission* — a lie the
+    moment the fill did not come, since `reconcile` rebuilds the book from broker
+    positions and the position it never saw closed came straight back next sweep. The
+    close must instead leave the structure **open and closing in flight**: an order
+    reached the broker (return True), but nothing is booked closed until the fill
+    confirms."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CLOSE_FILL_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),                       # below the 755 short put → breached
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        close_fill="working",                    # the close rests unfilled
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        rows = (await db.scalars(select(OpenStructureRow))).all()
+
+    assert len(broker.closes) == 1                     # the close was submitted
+    assert broker.close_polls                          # and polled for a fill
+    assert result.closed == 0                           # but nothing is booked closed
+    assert result.closing == 1                          # it is closing in flight
+    assert [r.status for r in rows] == ["open"]         # the registry still holds it
+    assert "1 closing" in result.summary
+    assert not result.warnings
+
+
+async def test_a_working_close_is_not_resubmitted_or_re_rested_next_sweep(
+    no_lock, monkeypatch
+):
+    """The anti-churn guarantee across two sweeps — the heart of the fix.
+
+    Sweep one submits a close that rests unfilled. Sweep two sees the same breach,
+    but the close it would send is already working at the broker, so it must submit
+    **nothing** — not a competing close, not a re-rested §2.6 target (both would go
+    through `submit_close`, so `broker.closes` staying at one proves neither
+    happened). This is precisely the loop that "closed" QQQ two dozen times: without
+    it, every five minutes cancelled the resting close and sent a fresh one that also
+    never filled, and the position rode into auto-exercise."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CLOSE_FILL_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        close_fill="working",
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        await S.run_manage(ctx, S.CycleResult(kind=CycleKind.MANAGE))    # sweep one
+        assert len(broker.closes) == 1
+
+        second = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, second)                                  # sweep two
+        rows = (await db.scalars(select(OpenStructureRow))).all()
+
+    assert len(broker.closes) == 1, "the working close must not be resubmitted"
+    assert second.closed == 0
+    assert second.closing == 1
+    assert "already closing" in second.summary
+    assert [r.status for r in rows] == ["open"]
+    assert not second.warnings
+
+
+async def test_a_drifted_working_close_is_cancelled_and_repriced(no_lock, monkeypatch):
+    """The one case where replacing a working close is right, not churn. A resting
+    close whose limit the market has run away from will never fill, so leaving it be
+    would strand the position. When the price we would submit now has drifted past
+    the tolerance, the close path cancels the stale order (waiting the cancel out to
+    free the legs) and submits a fresh one — the deliberate exception to 'leave a
+    working close alone'."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CLOSE_FILL_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),
+        quotes={                                 # package worth ~$9.20 to buy back now
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        # A stale resting close priced at $0.10 — far below what it now costs to exit.
+        resting=[working_close_for(structure, Decimal("0.10"))],
+        target_settle="canceled",                # the stale close cancels cleanly
+        close_fill="filled",                     # and the repriced one fills
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        rows = (await db.scalars(select(OpenStructureRow))).all()
+
+    assert broker.cancelled == [f"cls-{structure.underlying}"]   # stale close cancelled
+    assert len(broker.closes) == 1                               # and repriced
+    assert result.closed == 1                                     # the fresh one filled
+    assert [r.status for r in rows] == ["closed"]
+    assert any("repriced stale close" in n for n in result.notes)
 
 
 async def test_a_healthy_structure_is_held(no_lock):

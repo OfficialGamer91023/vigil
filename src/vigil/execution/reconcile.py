@@ -54,11 +54,25 @@ class BrokerPosition:
 
 @dataclass(frozen=True, slots=True)
 class RestingOrder:
-    """An open order at the broker, reduced to what reconciliation asks of it."""
+    """An open order at the broker, reduced to what reconciliation asks of it.
+
+    `tif` and `limit_price` exist for one caller — `_close_structure`. A §2.6
+    profit target and a management close are *both* closing orders on the same
+    legs, indistinguishable by `is_closing` alone, but they want opposite
+    treatment: the target (`gtc`) reserves the legs and must be cancelled before a
+    close can price against them; a working management close (`day`) is the close
+    we already sent and must be **left to fill**, not cancelled and re-priced every
+    sweep. The TIF tells them apart; the limit lets the close decide whether a
+    still-resting one has drifted far enough to be worth repricing. Both default to
+    empty/`None` so a caller that does not care (reconcile's target-presence check)
+    constructs a `RestingOrder` exactly as before.
+    """
 
     order_id: str
     symbols: frozenset[str]
     is_closing: bool
+    tif: str = ""
+    limit_price: Decimal | None = None
 
 
 def _infer_structure(
