@@ -510,6 +510,33 @@ def _best(candidates: list[TradeProposal]) -> TradeProposal:
     return min(candidates, key=_rank_key)
 
 
+def _stacks_on_open_structure(
+    candidate: TradeProposal, occupied: set[tuple[str, date]]
+) -> bool:
+    """True if entering `candidate` would put a second structure on an
+    (underlying, expiry) that already holds one.
+
+    **Do not remove this guard without reading — it is a broker constraint, not a
+    heuristic.** At the clearinghouse every option leg on the same underlying and
+    expiry nets into ONE position, and `reconcile.group_positions` models the book
+    on exactly that (underlying, expiry) key. A second structure there does not sit
+    beside the first — it *merges* with it into a single `OpenStructure`. Two 4-leg
+    credit condors so merged become an 8-leg geometry, and Alpaca's mleg close
+    ticket is hard-capped at 4 legs, so the position can no longer be closed and
+    strands into auto-exercise; the merged max_loss (both structures' wings summed)
+    is fabricated too.
+
+    The frozen kernel cannot catch this, and correctly so: Gate 6 permits two
+    structures per underlying, Gate 12 blocks only *identical* strikes, and each
+    proposal is legal in isolation — the defect exists only in the combined book.
+    So the entry path enforces the one-per-(underlying, expiry) rule the kernel
+    structurally cannot. A missed trade is free; an un-closable one is not. The
+    frictional soak (`make soak`) is the regression proof; this predicate is the
+    millisecond tripwire that fails the instant the guard is edited away.
+    """
+    return (candidate.underlying, candidate.expiry) in occupied
+
+
 async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
     """Sense, build, gate, submit **at most one** structure.
 
@@ -615,6 +642,14 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
         v.underlying: frozenset(c.occ.raw for c in v.chain) for v in views
     }
 
+    # --- Portfolio constraint: one structure per (underlying, expiry). -------
+    # A broker-imposed rule the frozen kernel structurally cannot enforce — see
+    # `_stacks_on_open_structure` for why stacking produces an un-closable 8-leg book.
+    # Read from the *live* reconciled book, so a pair frees the moment its structure's
+    # resting target fills.
+    occupied = {(s.underlying, s.expiry) for s in structures}
+    occupied_noted: set[tuple[str, date]] = set()
+
     # --- Phase 2: build and gate candidates against the refreshed book. ------
     for view in views:
         if view.verdict.structure is None:
@@ -630,6 +665,18 @@ async def run_entry(ctx: RunnerContext, result: CycleResult) -> None:
             core_risk_pct=core_risk_pct,
             convexity_share=rung.convexity_share,
         ):
+            if _stacks_on_open_structure(candidate, occupied):
+                # Already holding a structure here; a second would merge into an
+                # un-closable book at the broker. Noted once per pair so the journal
+                # records the constraint firing without a line per rejected candidate.
+                pair = (candidate.underlying, candidate.expiry)
+                if pair not in occupied_noted:
+                    occupied_noted.add(pair)
+                    result.note(
+                        f"{candidate.underlying} {candidate.expiry}: skipped — "
+                        "already holds an open structure (one per underlying+expiry)"
+                    )
+                continue
             decision = evaluate(candidate, state, ctx_for, ctx.risk)
             # **Every verdict is persisted, passes included** (§5). A table of
             # only rejections cannot answer "did any of this ever fire?".

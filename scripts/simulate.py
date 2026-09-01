@@ -27,15 +27,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import zlib
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from random import Random
 from types import SimpleNamespace
 
 from vigil.clock import ET, today_et
 from vigil.data.bars import SessionBars
 from vigil.data.chain import Contract
 from vigil.data.greeks import bs_price, year_fraction
+from vigil.execution.reconcile import structures_missing_targets
 from vigil.worker import sense as sense_module
 from vigil.worker import sessions as S
 from vigil.worker.broker import Broker
@@ -51,6 +54,74 @@ UNIVERSE = ("SPY", "QQQ")
 BASE_IV = {"SPY": 0.19, "QQQ": 0.24}
 BASE_SPOT = {"SPY": Decimal("765"), "QQQ": Decimal("715")}
 
+CENT = Decimal("0.01")
+
+
+# --------------------------------------------------------------------------- #
+# Frictions — the punches a real market throws that a clean BS chain does not.
+#
+# CLAUDE.md is explicit that paper P&L is optimistic: fills are generous, the
+# options feed is indicative, ~10% of fills arrive partial, and spreads widen when
+# you least want them to. A frictionless sim that prints a 100% win rate is worse
+# than no sim, because it launders those risks into a green check. This models the
+# four that move outcomes; everything here lives in the harness, never in `src/`.
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True, slots=True)
+class Frictions:
+    """Per-run market frictions. `enabled=False` is the clean baseline the batch
+    compares against — uniform 1¢ quotes, fills at the touch, no partials or gaps.
+
+    `rng` drives the *stochastic* frictions (partials, gaps), so a `--seed` still
+    reproduces a run to the cent. Spreads are deliberately **not** rng-driven: they
+    are a deterministic function of the strike (via `crc32`), so the chain the
+    kernel gates and the quotes the router fills against can never disagree within a
+    cycle without threading a shared cache through every call site.
+    """
+
+    rng: Random
+    enabled: bool = True
+    base_half_spread: Decimal = Decimal("0.012")  # ATM half-spread, dollars
+    moneyness_k: float = 7.0                        # how fast the spread widens OTM
+    jitter_lo: float = 0.6
+    jitter_hi: float = 1.5
+    partial_prob: float = 0.10                     # §1.2: ~10% of fills are partial
+    gap_prob: float = 0.20                         # a gap on ~1 in 5 cycle advances
+    gap_size: Decimal = Decimal("0.006")           # ~0.6% shock, enough to breach
+
+    def half_spread(self, strike: Decimal, spot: Decimal) -> Decimal:
+        """Half the bid-ask for one contract: wider OTM, wider on illiquid strikes.
+
+        The `crc32` term is a stable per-strike liquidity draw in [0,1) — the same
+        strike always gets the same jitter, so bid/ask are reproducible and the
+        kernel's liquidity view matches the fill engine's. Widening with moneyness
+        is what makes a condor's long wings the legs most likely to trip Gate 8.
+        """
+        if not self.enabled:
+            return HALF_SPREAD
+        moneyness = abs(float(strike) - float(spot)) / float(spot)
+        base = float(self.base_half_spread) * (1.0 + self.moneyness_k * moneyness)
+        draw = (zlib.crc32(str(strike).encode()) & 0xFFFF) / 0xFFFF
+        jitter = self.jitter_lo + draw * (self.jitter_hi - self.jitter_lo)
+        return Decimal(str(round(max(base * jitter, 0.01), 2)))
+
+    def fill_contracts(self, contracts: int) -> int:
+        """How many of `contracts` actually fill — occasionally a partial (§1.2)."""
+        if not self.enabled or contracts <= 1 or self.rng.random() >= self.partial_prob:
+            return contracts
+        return self.rng.randint(1, contracts - 1)
+
+    def gap_drift(self) -> Decimal:
+        """An occasional overnight-style jump layered on the cycle's normal drift.
+
+        This is the friction that creates *losing* days: a gap can carry spot
+        through a short strike between two cycles, which is exactly the breach the
+        manage sweep must catch and close at a loss. A sim that only drifts smoothly
+        never tests that path."""
+        if not self.enabled or self.rng.random() >= self.gap_prob:
+            return Decimal(0)
+        return self.rng.choice((Decimal(1), Decimal(-1))) * self.gap_size
+
 
 # --------------------------------------------------------------------------- #
 # Synthetic chain — priced by the project's own Black-Scholes, so `sense`, the
@@ -65,7 +136,7 @@ def _occ(underlying: str, expiry: date, is_put: bool, strike: Decimal) -> str:
 
 def _contract(
     underlying: str, expiry: date, is_put: bool, strike: Decimal,
-    *, spot: Decimal, iv: float, now: datetime,
+    *, spot: Decimal, iv: float, now: datetime, half_spread: Decimal,
 ) -> Contract | None:
     """One synthetic contract: a BS mid, a tight quote around it, modelled greeks.
 
@@ -81,8 +152,8 @@ def _contract(
     )))
     if price <= 0:
         return None
-    bid = max(price - HALF_SPREAD, Decimal("0.01"))
-    ask = price + HALF_SPREAD
+    bid = max(price - half_spread, Decimal("0.01"))
+    ask = price + half_spread
     snapshot = SimpleNamespace(
         latest_quote=SimpleNamespace(bid_price=float(bid), ask_price=float(ask)),
         greeks=None,                 # force the modelled path, exactly like the live feed
@@ -106,9 +177,13 @@ def _parse(underlying: str, expiry: date, is_put: bool, strike: Decimal):
 
 def build_chain(
     underlying: str, *, spot: Decimal, expiries: list[date], iv: float, now: datetime,
-    window: int = 12,
+    frictions: Frictions, window: int = 12,
 ) -> list[Contract]:
-    """A +/- `window`-dollar grid of $1 strikes, puts and calls, across `expiries`."""
+    """A +/- `window`-dollar grid of $1 strikes, puts and calls, across `expiries`.
+
+    Each strike's spread comes from `frictions`, so the wings are wider than the
+    body — the shape a real chain has, and the reason Gate 8 has anything to reject.
+    """
     lo = int(spot) - window
     hi = int(spot) + window
     out: list[Contract] = []
@@ -116,7 +191,8 @@ def build_chain(
         for k in range(lo, hi + 1):
             for is_put in (True, False):
                 c = _contract(underlying, expiry, is_put, Decimal(k),
-                              spot=spot, iv=iv, now=now)
+                              spot=spot, iv=iv, now=now,
+                              half_spread=frictions.half_spread(Decimal(k), spot))
                 if c is not None:
                     out.append(c)
     return out
@@ -167,13 +243,38 @@ class SimClient:
     real `Broker.structures()` reconstructs the same positions the agent will see.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, frictions: Frictions) -> None:
+        self.frictions = frictions
         self.positions: dict[str, _Pos] = {}
         self.resting: dict[str, _RestingOrder] = {}
         self.realized = Decimal(0)
         self._n = 0
         self.mark: dict[str, Decimal] = {}   # symbol -> current mid, refreshed each step
+        self.quotes: dict[str, tuple[Decimal, Decimal]] = {}   # symbol -> (bid, ask)
         self._orders_by_id: dict[str, object] = {}   # so a poll echoes the submitted order
+
+    def _quote(self, symbol: str) -> tuple[Decimal, Decimal]:
+        """Current (bid, ask). Falls back to a mid ± default spread off-grid."""
+        q = self.quotes.get(symbol)
+        if q is not None:
+            return q
+        m = self.mark.get(symbol, Decimal("0.10"))
+        return (max(m - HALF_SPREAD, CENT), m + HALF_SPREAD)
+
+    def _natural_credit(self, legs) -> Decimal:
+        """Signed per-contract credit the market will actually pay *right now*.
+
+        Sell the short legs at the bid, buy the long legs at the ask — the touch,
+        i.e. the worst price, which is what you get when you cross to fill. Positive
+        for a credit package, negative for a debit. The router's rung starts above
+        this (at the mid) and concedes toward it, so this is the number that decides
+        whether a given rung fills at all."""
+        total = Decimal(0)
+        for lg in legs:
+            bid, ask = self._quote(lg.symbol)
+            ratio = Decimal(getattr(lg, "ratio_qty", 1))
+            total += (bid if "sell" in lg.position_intent.value else -ask) * ratio
+        return total
 
     # ---- the account read the portfolio gates need -------------------------- #
     def get_account(self):
@@ -236,12 +337,28 @@ class SimClient:
             order = _order(oid, req.client_order_id, "filled",
                            _pkg_qty(req), str(req.limit_price), req.limit_price)
         else:
-            # An opening rung. Fill it fully and add the legs. A credit fills at a
-            # negative avg (the O-1 convention); the router abs()es it.
-            qty = _pkg_qty(req)
-            self._apply_open(legs, qty)
-            order = _order(oid, req.client_order_id, "filled", qty,
-                           f"-{abs(float(req.limit_price)):.2f}", req.limit_price)
+            # An opening rung. It fills only if this rung's price is one the market
+            # will actually pay (§2.5): a credit rung fills when we ask for no more
+            # than the natural credit; a debit rung when we offer at least the
+            # natural debit. Rung 1 sits at the mid, richer than the natural, so it
+            # does NOT fill — the router cancels and concedes, exactly the ladder
+            # walk the mid-fill sim never exercised. If no rung down to Gate 9's
+            # floor is payable, the ladder exhausts into a (free) NO_FILL.
+            requested = _pkg_qty(req)
+            natural = self._natural_credit(legs)
+            limit = Decimal(str(req.limit_price))
+            fillable = limit <= natural if natural >= 0 else limit >= -natural
+            if not fillable:
+                order = _order(oid, req.client_order_id, "new", 0, None, req.limit_price)
+            else:
+                # ~10% of paper fills arrive partial (§1.2). A partial reports
+                # `partially_filled`; the router rests a target sized to the fill and
+                # cancels the remainder rather than legging into a second ticket.
+                qty = self.frictions.fill_contracts(requested)
+                self._apply_open(legs, qty)
+                status = "filled" if qty >= requested else "partially_filled"
+                order = _order(oid, req.client_order_id, status, qty,
+                               f"-{abs(float(req.limit_price)):.2f}", req.limit_price)
 
         self._orders_by_id[oid] = order
         return order
@@ -260,9 +377,15 @@ class SimClient:
     # ---- book mechanics ---------------------------------------------------- #
     def _apply_open(self, legs, qty: int) -> None:
         for lg in legs:
-            sign = Decimal(-1) if "sell" in lg.position_intent.value else Decimal(1)
+            is_short = "sell" in lg.position_intent.value
+            sign = Decimal(-1) if is_short else Decimal(1)
             dq = sign * Decimal(qty) * Decimal(getattr(lg, "ratio_qty", 1))
-            price = self.mark.get(lg.symbol, Decimal("0.10"))
+            bid, ask = self._quote(lg.symbol)
+            # Fill each leg on the side that costs us: sell a short at the bid, buy a
+            # long at the ask. Booking the entry at the touch (not the mid) is what
+            # makes the round trip pay the bid-ask spread — the friction the old
+            # mid-fill never charged, and the reason paper P&L reads optimistic.
+            price = bid if is_short else ask
             self._add(lg.symbol, dq, price)
 
     def _apply_close(self, legs) -> None:
@@ -270,8 +393,12 @@ class SimClient:
             p = self.positions.get(lg.symbol)
             if p is None:
                 continue
-            m = self.mark.get(lg.symbol, p.avg)
-            self.realized += (m - p.avg) * p.qty * CONTRACT
+            bid, ask = self._quote(lg.symbol)
+            # Unwind on the side that fills: buy a short back at the ask, sell a long
+            # at the bid. Paired with the entry above, a flat round trip loses two
+            # half-spreads — before the market has moved a cent.
+            close_price = ask if p.qty < 0 else bid
+            self.realized += (close_price - p.avg) * p.qty * CONTRACT
             self.positions.pop(lg.symbol, None)
 
     def _add(self, symbol: str, dq: Decimal, price: Decimal) -> None:
@@ -294,12 +421,15 @@ class SimClient:
             debit = Decimal(0)
             priceable = True
             for lg in o.legs:
-                m = self.mark.get(lg["symbol"])
-                if m is None:
+                q = self.quotes.get(lg["symbol"])
+                if q is None:
                     priceable = False
                     break
-                # to close: buy back a short (+), sell a long (-)
-                debit += m if "buy" in lg["intent"] else -m
+                bid, ask = q
+                # to close: buy back a short at the ask (+), sell a long at the bid
+                # (-). Costing the buy-back at the ask (not the mid) is why a wider
+                # spread makes the 50% target genuinely harder to reach.
+                debit += ask if "buy" in lg["intent"] else -bid
             if not priceable or debit > Decimal(str(o.limit_price)):
                 continue
             self._apply_close([SimpleNamespace(
@@ -342,13 +472,45 @@ class SimBroker(Broker):
         return {c.occ.raw: 8000 for c in self.world.chain(underlying)}
 
     async def quotes(self, symbols):
+        # Read the exact (bid, ask) the chain was built with this cycle — the same
+        # numbers the kernel gated and the fill engine will book against — so a
+        # management price and an entry fill can never see different markets. Only a
+        # symbol that has drifted off the grid (after a gap) is recomputed.
         out = {}
         for s in symbols:
-            occ = _parse_raw(s)
-            m = _mid(occ.underlying, s, self.world.spots[occ.underlying],
-                     self.world.iv(occ.underlying), self.world.now)
-            out[s] = (m - HALF_SPREAD, m + HALF_SPREAD)
+            q = self.world.client.quotes.get(s)
+            if q is None:
+                occ = _parse_raw(s)
+                spot = self.world.spots[occ.underlying]
+                m = _mid(occ.underlying, s, spot, self.world.iv(occ.underlying),
+                         self.world.now)
+                hs = self.world.frictions.half_spread(occ.strike, spot)
+                q = (max(m - hs, CENT), m + hs)
+            out[s] = q
         return out
+
+    async def submit_entry(self, proposal, state, context, *, risk=None, strategy=None):
+        """Same real router as production, with the ladder's fill-poll dwell skipped.
+
+        `SimClient` fills rung 1 synchronously, so the router's real
+        `RUNG_WAIT_SECONDS` wait between submit and poll is pure dead wall-clock —
+        20s × two entries = 40s per simulated day, which makes a soak of hundreds of
+        days infeasible. Injecting a no-op `sleep` removes only the wait: the same
+        `execution.router.submit_entry` runs, gates, builds the ladder, submits and
+        polls exactly as it will live. The 20s dwell is exercised for real by the
+        worker and by `tests/`, not here.
+        """
+        import asyncio  # noqa: PLC0415
+
+        from vigil.execution.router import (  # noqa: PLC0415
+            submit_entry as _router_submit_entry,
+        )
+
+        return await asyncio.to_thread(
+            _router_submit_entry, proposal, state, context,
+            client=self.client, risk=risk, strategy=strategy,
+            sleep=lambda _s: None,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +524,7 @@ class World:
     spots: dict[str, Decimal]
     trend: Decimal                      # per-cycle drift applied to spots
     client: SimClient
+    frictions: Frictions
     iv_scale: float = 1.0               # a vol crush (<1) collapses extrinsic value
     _chains: dict[str, list[Contract]] = field(default_factory=dict)
 
@@ -374,14 +537,20 @@ class World:
     def rebuild(self) -> None:
         self._chains = {
             u: build_chain(u, spot=self.spots[u], expiries=self.expiries(),
-                           iv=self.iv(u), now=self.now)
+                           iv=self.iv(u), now=self.now, frictions=self.frictions)
             for u in UNIVERSE
         }
-        # Refresh every mark the client holds, plus every strike it might trade.
-        self.client.mark = {
-            c.occ.raw: (c.mid or Decimal("0.01"))
-            for u in UNIVERSE for c in self._chains[u]
-        }
+        # Refresh the client's marks (mids, for mark-to-market) and its quote cache
+        # (bid/ask, for fills) from the chain just built, so the fill engine and the
+        # kernel are looking at one market.
+        self.client.mark = {}
+        self.client.quotes = {}
+        for u in UNIVERSE:
+            for c in self._chains[u]:
+                mid = c.mid or CENT
+                hs = self.frictions.half_spread(c.occ.strike, self.spots[u])
+                self.client.mark[c.occ.raw] = mid
+                self.client.quotes[c.occ.raw] = (max(mid - hs, CENT), mid + hs)
 
     def chain(self, underlying: str) -> list[Contract]:
         return self._chains[underlying]
@@ -390,8 +559,12 @@ class World:
         self.now = self.now + timedelta(minutes=minutes)
         if iv_scale is not None:
             self.iv_scale = iv_scale
+        # A gap rides on top of the cycle's normal drift ~1 in 5 advances. This is
+        # what carries spot through a short strike between cycles, forcing the
+        # breach-exit and turning some days red — the whole point of the friction.
+        total_drift = drift + self.frictions.gap_drift()
         for u in UNIVERSE:
-            self.spots[u] = (self.spots[u] * (Decimal(1) + drift)).quantize(Decimal("0.01"))
+            self.spots[u] = (self.spots[u] * (Decimal(1) + total_drift)).quantize(CENT)
         self.rebuild()
 
 
@@ -530,34 +703,143 @@ def _print_book(world: World) -> None:
         print(f"    book {u}: {len(legs)} legs, {resting} resting target(s) total")
 
 
-async def simulate(regime: str, seed: int) -> int:
-    import logging
-    import random
+# --------------------------------------------------------------------------- #
+# Invariants — the properties that must hold on EVERY simulated day, or the
+# agent has a bug that live money would pay for. Checked against the real
+# reconstructed book (`broker.structures()` → `group_positions`), never a
+# re-derivation: a failure here is the agent's own view of the world breaking.
+# --------------------------------------------------------------------------- #
 
-    from vigil.logging import configure
+# Hard rule #2 caps risk per trade at 2% of equity. A structure's max_loss is
+# one trade's risk; the tolerance absorbs intraday equity drift between the
+# entry (when Gate 2 checked) and this later snapshot — it is not slack in the
+# gate itself, which the Hypothesis test in tests/test_gates.py owns exactly.
+RISK_PER_TRADE = Decimal("0.02")
+RISK_TOLERANCE = Decimal("1.10")
 
-    # Quiet the per-cycle JSON logs (they go to stderr) so the narrative reads
-    # clean; warnings — §2.6 defects, failed cycles — still surface.
-    configure(level=logging.WARNING)
 
-    rng = random.Random(seed)
-    await _reset_journal()               # clean slate — no rows bleed between runs
-    day = today_et()
+@dataclass(frozen=True, slots=True)
+class Violation:
+    """One broken invariant, tagged with where it happened so it is reproducible."""
+    cycle: str
+    kind: str
+    detail: str
+
+
+def _naked_or_undefined(s) -> str | None:
+    """Hard rule #3: no naked short leg, and every structure has finite max loss.
+
+    Reads the reconstructed legs, so a short with no covering long on the same
+    right — the exact shape "temporarily while legging in" would produce — is
+    caught regardless of how the book got into that state.
+    """
+    if not s.has_short_legs:
+        return None                      # long-only: premium paid is the whole risk
+    shorts_p = longs_p = shorts_c = longs_c = 0
+    for leg in s.legs:
+        occ = _parse_raw(leg.symbol)
+        if occ.is_put:
+            shorts_p, longs_p = (shorts_p + 1, longs_p) if leg.is_short else (shorts_p, longs_p + 1)
+        else:
+            shorts_c, longs_c = (shorts_c + 1, longs_c) if leg.is_short else (shorts_c, longs_c + 1)
+    if shorts_p and not longs_p:
+        return f"naked short put ({shorts_p} short, 0 long) on {s.underlying} {s.expiry}"
+    if shorts_c and not longs_c:
+        return f"naked short call ({shorts_c} short, 0 long) on {s.underlying} {s.expiry}"
+    if not s.max_loss.is_finite() or s.max_loss <= 0:
+        return f"non-positive/undefined max_loss ${s.max_loss} on {s.underlying} {s.expiry}"
+    return None
+
+
+def check_invariants(
+    structures, equity: Decimal, prev_defects: frozenset[object], cycle: str,
+) -> tuple[list[Violation], frozenset[object]]:
+    """Every invariant that must hold this cycle. Returns violations + the current
+    §2.6 defect set, so the caller can tell a transient defect from a persistent one.
+    """
+    out: list[Violation] = []
+
+    if not equity.is_finite():
+        out.append(Violation(cycle, "equity", f"equity is not a finite number: {equity}"))
+
+    risk_cap = equity * RISK_PER_TRADE * RISK_TOLERANCE
+    for s in structures:
+        naked = _naked_or_undefined(s)
+        if naked is not None:
+            out.append(Violation(cycle, "defined-risk", naked))
+        if s.max_loss.is_finite() and s.max_loss > risk_cap:
+            out.append(Violation(
+                cycle, "sizing",
+                f"{s.underlying} {s.expiry} risks ${s.max_loss:,.0f} > 2%×equity "
+                f"(${risk_cap:,.0f})"))
+
+    # §2.6: an open structure with no resting target is a defect. A single cycle
+    # is tolerated (flatten strips targets; the next sweep re-rests them); a defect
+    # that survives into the cycle where it was already a defect is the real fault.
+    defects = frozenset(s.structure_key for s in structures_missing_targets(structures))
+    for s in structures:
+        if s.structure_key in defects and s.structure_key in prev_defects:
+            out.append(Violation(
+                cycle, "§2.6-persistent",
+                f"{s.underlying} {s.expiry} had no resting profit target for two "
+                f"consecutive cycles"))
+    return out, defects
+
+
+# --------------------------------------------------------------------------- #
+# One simulated day — the scripted plan, returning what happened instead of only
+# printing it, so `make sim` (verbose) and `make soak` (batch) share one path.
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True, slots=True)
+class DayOutcome:
+    regime: str
+    seed: int
+    day: date
+    entries: int
+    final_equity: Decimal
+    day_pnl: Decimal
+    realized: Decimal
+    unrealized: Decimal
+    open_legs: int
+    violations: list[Violation]
+
+    @property
+    def traded(self) -> bool:
+        return self.entries > 0
+
+    @property
+    def clean(self) -> bool:
+        return not self.violations
+
+
+def _drift_for(regime: str) -> Decimal:
+    return {"trend_up": Decimal("0.0006"), "trend_down": Decimal("-0.0006"),
+            "chop": Decimal("0.0001")}.get(regime, Decimal("0.0006"))
+
+
+async def run_day(
+    regime: str, seed: int, *, day: date, verbose: bool, friction: bool = True,
+) -> DayOutcome:
+    """Drive one full synthetic day through the real pipeline and score it.
+
+    `verbose` prints the cycle-by-cycle narrative (`make sim`); the batch path runs
+    it silently and reads the returned `DayOutcome`. A fresh `SimClient` per call
+    makes each day an independent 100k draw — the batch wants i.i.d. days, not a
+    compounding equity curve. `friction=False` runs the clean baseline (no wide
+    spreads, slippage, partials or gaps).
+    """
+    rng = Random(seed)
+    frictions = Frictions(rng=rng, enabled=friction)
     start = datetime.combine(day, time(9, 45), tzinfo=ET)
-    client = SimClient()
+    client = SimClient(frictions)
     world = World(now=start, day=day, spots=dict(BASE_SPOT), trend=Decimal("0.001"),
-                  client=client)
+                  client=client, frictions=frictions)
     world.rebuild()
     _install_bar_stubs(world, regime)
     broker = SimBroker(client, world)
 
-    drift = {"trend_up": Decimal("0.0006"), "trend_down": Decimal("-0.0006"),
-             "chop": Decimal("0.0001")}.get(regime, Decimal("0.0006"))
-
-    print("=" * 72)
-    print(f" VIGIL offline day simulator — regime={regime} seed={seed} date={day}")
-    print(" synthetic chain (BS-priced), real kernel + ladder + reconcile, no network")
-    print("=" * 72)
+    drift = _drift_for(regime)
 
     # A scripted day, sequenced so each structure's target fills (or is flattened)
     # before the next entry — two live structures on one underlying+expiry would
@@ -581,6 +863,10 @@ async def simulate(regime: str, seed: int) -> int:
         (CycleKind.POSTCLOSE, 25, Decimal("0"),      1.0,  "close the books"),
     ]
 
+    entries = 0
+    violations: list[Violation] = []
+    prev_defects: frozenset[object] = frozenset()
+
     for kind, mins, d, ivs, note in plan:
         if mins:
             # jitter the drift a little so no two runs are identical
@@ -589,21 +875,208 @@ async def simulate(regime: str, seed: int) -> int:
         # Between cycles the market moved — let any reached target fill before the
         # agent looks, so reconcile sees it vanish (the §2.6 "closed unobserved" path).
         for coid in client.fill_reached_targets():
-            print(f"\n    ~ [{_hms(world.now)}] resting profit target FILLED at the broker: {coid}")
-        result = await _run(kind, broker)
-        _print_cycle(world, kind, result, note)
-        _print_book(world)
+            if verbose:
+                print(f"\n    ~ [{_hms(world.now)}] resting profit target FILLED "
+                      f"at the broker: {coid}")
+
+        # A cycle that *raises* is the most severe finding there is: the agent threw
+        # mid-session, which live would mean a stuck loop or a position it cannot act
+        # on. We record it as a violation and stop the day rather than letting one
+        # bad day abort a 150-day batch — surfacing the crash, never swallowing it.
+        try:
+            result = await _run(kind, broker)
+        except Exception as exc:  # noqa: BLE001 — the crash *is* the finding
+            detail = f"{type(exc).__name__}: {exc}"
+            violations.append(Violation(kind.value, "pipeline-crash", detail[:200]))
+            if verbose:
+                print(f"\n[{_hms(world.now)}] {kind.value.upper()} — CRASHED")
+                print(f"    !! INVARIANT [pipeline-crash] {detail[:200]}")
+            break
+        entries += result.submitted
+
+        # Score the book the agent itself just reconstructed — same reconciliation
+        # the manage sweep uses, so a failure is the agent's own view breaking.
+        structures = await broker.structures()
+        equity = Decimal(client.get_account().equity)
+        cycle_violations, prev_defects = check_invariants(
+            structures, equity, prev_defects, kind.value)
+        violations.extend(cycle_violations)
+
+        if verbose:
+            _print_cycle(world, kind, result, note)
+            _print_book(world)
+            for v in cycle_violations:
+                print(f"    !! INVARIANT [{v.kind}] {v.detail}")
 
     acct = client.get_account()
-    pnl = Decimal(acct.equity) - Decimal(100_000)
     cents = Decimal("0.01")
+    pnl = (Decimal(acct.equity) - Decimal(100_000)).quantize(cents)
     realized = client.realized.quantize(cents)
-    open_legs = len([p for p in client.positions.values() if p.qty])
-    print("\n" + "=" * 72)
-    print(f" DONE  final equity {acct.equity}  day P&L {pnl.quantize(cents):+}  "
-          f"realized {realized:+}  unrealized {(pnl - realized):+}  open legs {open_legs}")
+    return DayOutcome(
+        regime=regime, seed=seed, day=day, entries=entries,
+        final_equity=Decimal(acct.equity), day_pnl=pnl, realized=realized,
+        unrealized=(pnl - realized), open_legs=len([p for p in client.positions.values() if p.qty]),
+        violations=violations,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# `make sim` — one narrated day.
+# --------------------------------------------------------------------------- #
+
+async def simulate(regime: str, seed: int, friction: bool) -> int:
+    import logging
+
+    from vigil.logging import configure
+
+    # Quiet the per-cycle JSON logs (they go to stderr) so the narrative reads
+    # clean; warnings — §2.6 defects, failed cycles — still surface.
+    configure(level=logging.WARNING)
+
+    await _reset_journal()               # clean slate — no rows bleed between runs
+    day = today_et()
+    frictions = "ON (spreads, slippage, partials, gaps)" if friction else "OFF (mid fills)"
     print("=" * 72)
-    return 0
+    print(f" VIGIL offline day simulator — regime={regime} seed={seed} date={day}")
+    print(" synthetic chain (BS-priced), real kernel + ladder + reconcile, no network")
+    print(f" frictions: {frictions}")
+    print("=" * 72)
+
+    outcome = await run_day(regime, seed, day=day, verbose=True, friction=friction)
+
+    print("\n" + "=" * 72)
+    print(f" DONE  final equity {outcome.final_equity}  day P&L {outcome.day_pnl:+}  "
+          f"realized {outcome.realized:+}  unrealized {outcome.unrealized:+}  "
+          f"open legs {outcome.open_legs}")
+    if outcome.violations:
+        print(f" INVARIANTS  ✗ {len(outcome.violations)} violation(s) — see !! lines above")
+    else:
+        print(" INVARIANTS  ✓ all held")
+    print("=" * 72)
+    return 1 if outcome.violations else 0
+
+
+# --------------------------------------------------------------------------- #
+# `make soak` — many days × regimes, a performance distribution + invariant audit.
+# --------------------------------------------------------------------------- #
+
+def _fmt(d: Decimal | float) -> str:
+    return f"{float(d):+,.0f}"
+
+
+def _pctl(values: list[float], q: float) -> float:
+    """The `q`-quantile by nearest-rank — no numpy for one number (PLAN §12)."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    idx = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
+    return s[idx]
+
+
+async def _binding_gate() -> tuple[str, int, int] | None:
+    """The gate that rejected the most candidates across the whole batch.
+
+    Read from `reporting.gate_stats` — the same journal query the session report
+    and the desk use — rather than counted here, so the soak and the report agree.
+    """
+    from vigil.db.repositories import reporting as R
+    from vigil.db.session import get_session
+
+    async with get_session() as db:
+        stats = await R.gate_stats(db)
+    blockers = [(name, ok, bad) for _, name, ok, bad in stats if bad > 0]
+    if not blockers:
+        return None
+    name, ok, bad = max(blockers, key=lambda t: t[2])
+    return name, bad, ok + bad
+
+
+async def soak(days: int, regimes: list[str], friction: bool) -> int:
+    """Run `days` independent days per regime, aggregate, audit invariants.
+
+    Resets the journal once (not per day) so `gate_stats` accumulates the whole
+    batch; each day still gets a fresh account book via its own `SimClient`, and a
+    distinct trading date so the sessions never collide.
+    """
+    import logging
+
+    from vigil.logging import configure
+
+    configure(level=logging.ERROR)       # the batch is loud; keep only real errors
+    await _reset_journal()
+
+    base = today_et()
+    outcomes: list[DayOutcome] = []
+    total = days * len(regimes)
+    done = 0
+    for regime in regimes:
+        for seed in range(1, days + 1):
+            # Distinct past dates → one session per simulated day, no collisions.
+            day = base - timedelta(days=done + 1)
+            outcomes.append(
+                await run_day(regime, seed, day=day, verbose=False, friction=friction))
+            done += 1
+            print(f"\r  running… {done}/{total} days", end="", flush=True)
+    print("\r" + " " * 40 + "\r", end="")
+
+    pnls = [float(o.day_pnl) for o in outcomes]
+    traded = [o for o in outcomes if o.traded]
+    wins = [o for o in traded if o.day_pnl > 0]
+    all_violations = [(o, v) for o in outcomes for v in o.violations]
+    clean_days = sum(1 for o in outcomes if o.clean)
+
+    print("=" * 72)
+    print(f" VIGIL soak · {total} days ({days} × {len(regimes)} regime(s)) · "
+          f"frictions {'ON' if friction else 'OFF'}")
+    print("=" * 72)
+
+    # Per-regime one-liners, so a strategy that only works in a trend is obvious.
+    print(" per regime:")
+    for regime in regimes:
+        rs = [o for o in outcomes if o.regime == regime]
+        rt = [o for o in rs if o.traded]
+        rw = [o for o in rt if o.day_pnl > 0]
+        mean_pnl = sum(o.day_pnl for o in rs) / len(rs) if rs else Decimal(0)
+        trade_rate = len(rt) / len(rs) if rs else 0.0
+        win_rate = len(rw) / len(rt) if rt else None
+        wr = "—" if win_rate is None else f"{win_rate:.0%}"
+        print(f"   {regime:11} mean P&L {_fmt(mean_pnl):>9}  "
+              f"traded {trade_rate:.0%}  win {wr}")
+
+    print()
+    if pnls:
+        print(f" P&L per day   mean {_fmt(sum(pnls) / len(pnls)):>9}   "
+              f"median {_fmt(_pctl(pnls, 0.5)):>9}")
+        print(f"               p10 {_fmt(_pctl(pnls, 0.10)):>9}   "
+              f"worst {_fmt(min(pnls)):>9}   best {_fmt(max(pnls)):>9}")
+    overall_wr = f"{len(wins) / len(traded):.0%}" if traded else "—"
+    stand_down = f"{1 - len(traded) / len(outcomes):.0%}" if outcomes else "—"
+    print(f" win rate      {overall_wr} of traded days   stand-down {stand_down} of days")
+
+    gate = await _binding_gate()
+    if gate is not None:
+        name, bad, seen = gate
+        print(f" binding gate  '{name}' rejected {bad} of {seen} candidate(s) "
+              f"({bad / seen:.0%})")
+
+    crashes = [(o, v) for o, v in all_violations if v.kind == "pipeline-crash"]
+
+    print()
+    if not all_violations:
+        print(f" INVARIANTS    ✓ {clean_days}/{total} days clean "
+              f"(0 naked legs, 0 oversized trades, 0 persistent §2.6 defects)")
+    else:
+        if crashes:
+            print(f" PIPELINE      ✗ {len(crashes)} day(s) CRASHED mid-session — "
+                  f"the agent threw and could not continue:")
+            for o, v in crashes[:6]:
+                print(f"   · {o.regime}/seed{o.seed} [{v.cycle}] {v.detail}")
+        print(f" INVARIANTS    ✗ {len(all_violations)} violation(s) across "
+              f"{total - clean_days} day(s):")
+        for o, v in [x for x in all_violations if x[1].kind != "pipeline-crash"][:12]:
+            print(f"   · {o.regime}/seed{o.seed} [{v.cycle}:{v.kind}] {v.detail}")
+    print("=" * 72)
+    return 1 if all_violations else 0
 
 
 def main() -> int:
@@ -612,8 +1085,21 @@ def main() -> int:
                     choices=["trend_up", "trend_down", "chop"],
                     help="steer the synthetic tape (default: trend_up)")
     ap.add_argument("--seed", type=int, default=1, help="price-path seed")
+    ap.add_argument("--batch", action="store_true",
+                    help="soak mode: many days × regimes, distribution + invariant audit")
+    ap.add_argument("--days", type=int, default=50,
+                    help="soak mode: days per regime (default: 50 → 150 total)")
+    ap.add_argument("--no-friction", action="store_true",
+                    help="disable market frictions (mid fills) — the old clean sim")
     args = ap.parse_args()
-    return asyncio.run(simulate(args.regime, args.seed))
+    friction = not args.no_friction
+    if args.batch:
+        # Always sweep all three regimes — a single-regime soak hides exactly the
+        # failure (works in a trend, breaks in chop) the batch exists to find, so
+        # --regime is ignored here on purpose.
+        return asyncio.run(
+            soak(args.days, ["trend_up", "trend_down", "chop"], friction))
+    return asyncio.run(simulate(args.regime, args.seed, friction))
 
 
 if __name__ == "__main__":
