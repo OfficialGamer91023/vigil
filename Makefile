@@ -63,6 +63,17 @@ smoke:
 sim:
 	$(RUN) python scripts/simulate.py $(ARGS)
 
+# Soak: many independent days x all three regimes through the same real pipeline,
+# WITH market frictions on by default (natural-side fills so the round trip pays the
+# spread, variable spreads, ~10% partial fills, ~0.6% gaps that breach strikes).
+# Reports a performance distribution (P&L spread, win rate, stand-down, binding gate),
+# a per-day invariant audit (no naked leg, no trade > 2% risk, no persistent §2.6
+# defect), and any day that CRASHED mid-session. Exits non-zero on any violation, so
+# it belongs in CI. Needs the journal DB, like `make sim`. Scale/steer it with:
+#   make soak            |   make soak ARGS="--days 300"   |   make soak ARGS="--no-friction"
+soak:
+	$(RUN) python scripts/simulate.py --batch $(ARGS)
+
 # --- The agent (PLAN §2.3) --------------------------------------------------
 # The in-process scheduler. No Redis, no API, no web — hard rule #6 says the
 # worker must run correctly with all three stopped, and this is that claim being

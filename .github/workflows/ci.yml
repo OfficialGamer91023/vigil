@@ -1,9 +1,13 @@
 name: CI
 
-# Keep it to the three checks the Makefile already runs — ruff, mypy, pytest —
-# against a real Postgres, so the journal and integration tests exercise database
-# guarantees rather than skipping. Not load-bearing for any deliverable; it is the
-# green-badge signal that the suite still passes from a clean checkout.
+# The checks the Makefile already runs — ruff, mypy, pytest — against a real
+# Postgres, so the journal and integration tests exercise database guarantees rather
+# than skipping. Then `make soak`: a seeded, frictional Monte-Carlo replay of the
+# whole trading pipeline (150 days × 3 regimes) that asserts the hard invariants on
+# every path and exits non-zero on any breach — a rare-path *behavioural* gate the
+# unit suite cannot give, since the bugs it catches only appear across hundreds of
+# randomised sessions. It is blocking: a red soak means the agent can reach an
+# un-closable book, and that must not merge to main.
 
 on:
   push:
@@ -84,3 +88,13 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
+
+      # Blocking behavioural gate: the frictional soak drives the real kernel,
+      # router and reconcile through 150 seeded days and fails the build on any
+      # invariant breach or mid-session crash (e.g. a structure stacking into an
+      # un-closable 8-leg book). Seeded, so it is deterministic; runs after the
+      # migration because it needs the journal schema, like the unit suite. Uses the
+      # same DATABASE_URL — the steps are sequential, so it never races pytest's
+      # TRUNCATE isolation. `make soak` is the exact command run locally.
+      - name: Soak (frictional invariant audit)
+        run: make soak
