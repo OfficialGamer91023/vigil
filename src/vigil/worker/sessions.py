@@ -287,7 +287,40 @@ async def _close_structure(
 
     value = package_mid([(*quotes[leg.symbol], leg.is_short) for leg in s.legs])
     limit = closing_limit(value)
-    order = await ctx.broker.submit_close(s, limit, reason=decision.reason)
+
+    # The resting GTC profit target this structure carries (§2.6) reserves its leg
+    # quantity at the broker (`held_for_orders`), so a close submitted against the
+    # same legs is rejected for insufficient available quantity — the failure that
+    # was tearing down the whole manage cycle every sweep. Cancel the structure's
+    # own resting exit first to free the contracts, scoped by leg symbols so a
+    # sibling structure's target is untouched. The 15:40 flatten does the same thing
+    # wholesale (`cancel_all_orders` → close); this is the per-structure version.
+    leg_symbols = set(symbols)
+    try:
+        for r in await ctx.broker.resting_orders():
+            if r.is_closing and leg_symbols <= r.symbols:
+                await ctx.broker.cancel_order(r.order_id)
+                result.note(
+                    f"cancelled resting target {r.order_id[:8]} on "
+                    f"{s.underlying} {s.expiry} before close"
+                )
+        order = await ctx.broker.submit_close(s, limit, reason=decision.reason)
+    except Exception as exc:  # noqa: BLE001 — an unclosable position is the worst thing in the book
+        # Degrade to a loud warning rather than let the error abort the sweep (the
+        # old behaviour: the raw APIError escaped the cycle, `finished_at` never got
+        # written, and every structure queued after this one went unmanaged). The
+        # position stays covered by the 15:40 flatten and the breach rule, and a
+        # retry next sweep is safe — the resting-target cancel is idempotent and the
+        # close is a fresh order.
+        result.warnings.append(
+            f"CLOSE FAILED {s.underlying} {s.expiry}: {str(exc)[:120]}. Not closed "
+            f"this cycle; the 15:40 flatten and breach rule still cover it."
+        )
+        log.warning(
+            "structure.close_failed",
+            underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
+        )
+        return False
 
     await J.record_order(
         ctx.db,
@@ -416,10 +449,27 @@ async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruc
     decisions = sweep(structures, spots=spots, now=now_et(), config=ctx.strategy)
 
     for decision in decisions:
-        if decision.closes:
-            await _close_structure(ctx, decision, result)
-        elif decision.action is Action.REPLACE_TARGET:
-            await _replace_target(ctx, decision, result)
+        # Belt-and-suspenders: `_close_structure` and `_replace_target` already
+        # degrade their own submit failures to warnings, but the sweep protects
+        # capital and must finish — so any *unforeseen* raise (a spot read, a future
+        # handler) is contained here rather than skipping every structure queued
+        # after it and leaving the cycle unfinished. `closes`-first ordering (see
+        # `sweep`) means risk-off actions still run before this can matter.
+        try:
+            if decision.closes:
+                await _close_structure(ctx, decision, result)
+            elif decision.action is Action.REPLACE_TARGET:
+                await _replace_target(ctx, decision, result)
+        except Exception as exc:  # noqa: BLE001 — the sweep must complete for the rest of the book
+            s = decision.structure
+            result.warnings.append(
+                f"management error on {s.underlying} {s.expiry}: {str(exc)[:120]} "
+                f"— remaining structures still swept; 15:40 flatten still covers it"
+            )
+            log.warning(
+                "manage.structure_failed",
+                underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
+            )
 
     held = sum(1 for d in decisions if d.action is Action.HOLD)
     result.note(f"swept {len(decisions)} structure(s): {result.closed} closed, {held} held")

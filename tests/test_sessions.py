@@ -24,6 +24,7 @@ from vigil.db.models import Order as OrderRow
 from vigil.db.repositories import journal as J
 from vigil.db.session import get_session
 from vigil.domain import OpenStructure, PositionLeg, Structure
+from vigil.execution.reconcile import RestingOrder
 from vigil.worker import sessions as S
 from vigil.worker.broker import AccountView
 from vigil.worker.schedule import CycleKind
@@ -106,6 +107,8 @@ class StubBroker:
         equity: Decimal = Decimal(100_000),
         quotes: dict[str, tuple[Decimal, Decimal]] | None = None,
         spot: Decimal = Decimal("760.00"),
+        resting: list[RestingOrder] | None = None,
+        close_error: bool = False,
     ) -> None:
         self._structures = structures
         self._equity = equity
@@ -113,6 +116,14 @@ class StubBroker:
         self._spot = spot
         self.closes: list[tuple[OpenStructure, Decimal, str, bool]] = []
         self.cancelled_all = False
+        # Resting orders the broker is holding, and the per-order cancels asked of
+        # it. Together they let a test prove a close cancels the structure's own
+        # resting target *before* submitting — the fix for the manage-cycle crash.
+        self._resting = list(resting or [])
+        self.cancelled: list[str] = []
+        # When True, every close submit raises — for the sweep-hardening test, where
+        # the point is that one structure's failure must not abort the others.
+        self._close_error = close_error
 
     @property
     def client(self):
@@ -140,7 +151,24 @@ class StubBroker:
         return {sym: self.quotes_by_symbol[sym] for sym in symbols
                 if sym in self.quotes_by_symbol}
 
+    async def resting_orders(self) -> list[RestingOrder]:
+        return list(self._resting)
+
+    async def cancel_order(self, order_id: str) -> None:
+        self.cancelled.append(order_id)
+        # Cancelling frees the reserved quantity — model that by dropping the order,
+        # so a subsequent close of the same legs is no longer blocked.
+        self._resting = [r for r in self._resting if r.order_id != order_id]
+
     async def submit_close(self, structure, limit_price, *, reason, good_till_cancelled=False):
+        if self._close_error:
+            raise RuntimeError("submit_close failed (stubbed)")
+        # Model Alpaca's rule (code 40310000): a leg whose quantity is still reserved
+        # by an uncancelled resting order cannot be closed. This is what makes the
+        # test a true ordering tripwire — a close submitted before the cancel raises.
+        leg_symbols = {leg.symbol for leg in structure.legs}
+        if any(r.is_closing and leg_symbols <= r.symbols for r in self._resting):
+            raise RuntimeError("insufficient qty available for order (held_for_orders)")
         self.closes.append((structure, limit_price, reason, good_till_cancelled))
         return StubOrder(f"vigil-cls-{structure.underlying}-{len(self.closes)}")
 
@@ -171,6 +199,16 @@ def make_structure(
             PositionLeg(symbol=f"{underlying}260828P00755000", ratio_qty=1, is_short=True),
             PositionLeg(symbol=f"{underlying}260828P00754000", ratio_qty=1, is_short=False),
         ),
+    )
+
+
+def resting_for(structure: OpenStructure) -> RestingOrder:
+    """A live resting *closing* order covering exactly this structure's legs — the
+    §2.6 profit target the router places on every fill."""
+    return RestingOrder(
+        order_id=f"rest-{structure.underlying}",
+        symbols=frozenset(leg.symbol for leg in structure.legs),
+        is_closing=True,
     )
 
 
@@ -302,6 +340,105 @@ async def test_a_breached_structure_is_closed_and_journalled(no_lock, monkeypatc
     assert [o.intent for o in orders] == ["close"]
     assert [r.status for r in rows] == ["closed"]
     assert result.closed == 1
+
+
+async def test_a_breached_structure_cancels_its_resting_target_before_closing(
+    no_lock, monkeypatch
+):
+    """The manage-cycle crash, pinned as a millisecond tripwire.
+
+    A breached structure carries a live resting GTC target (§2.6) whose reservation
+    of the leg quantity (`held_for_orders`) makes a naive close fail with
+    'insufficient qty available' — the exact APIError that was tearing the whole
+    manage sweep down every five minutes in the live paper session. The close must
+    cancel that target first, then submit. `StubBroker` models the broker rule, so a
+    submit-*before*-cancel raises — which means this test fails the instant the
+    cancel-first ordering is removed."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),                       # below the 755 short put → breached
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        resting=[resting_for(structure)],        # the §2.6 target holding the legs
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+
+    assert broker.cancelled == [f"rest-{structure.underlying}"]   # target freed first
+    assert len(broker.closes) == 1                                # and the close went through
+    assert result.closed == 1
+    assert not result.warnings
+
+
+async def test_a_failed_close_submit_degrades_to_a_warning(no_lock, monkeypatch):
+    """The production failure mode, contained. The close submit itself raises (an
+    APIError, say). The old behaviour let it escape and abort the cycle, leaving
+    `finished_at` NULL and every later structure unmanaged; now it is a loud
+    'CLOSE FAILED' warning and the sweep completes. Safe because the 15:40 flatten
+    and the breach rule still cover the position, and a retry next sweep is clean."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        close_error=True,
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)          # must not raise
+
+    assert broker.closes == []
+    assert result.closed == 0
+    assert any("CLOSE FAILED" in w for w in result.warnings)
+
+
+async def test_a_raise_on_one_structure_does_not_abort_the_rest_of_the_sweep(
+    no_lock, monkeypatch
+):
+    """Sweep-hardening (the belt-and-suspenders layer). An *unforeseen* raise on one
+    structure — here a quote read that blows up before `_close_structure`'s own
+    guard — must be contained, not skip every structure queued behind it. The
+    healthy structure still closes; the broken one is a loud, per-structure warning.
+    Management protects capital, so the sweep finishing for the rest of the book
+    matters more than any single structure's success."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    exp = MID_SESSION.date() + timedelta(days=1)
+    good = make_structure(underlying="SPY", expiry=exp)
+    bad = make_structure(underlying="QQQ", expiry=exp)
+
+    class ExplodingQuotes(StubBroker):
+        async def quotes(self, symbols):
+            if any(sym.startswith("QQQ") for sym in symbols):
+                raise RuntimeError("quote feed exploded")
+            return await super().quotes(symbols)
+
+    broker = ExplodingQuotes(
+        structures=(good, bad),
+        spot=Decimal(750),                       # both breached
+        quotes={
+            good.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            good.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)          # must not raise
+
+    assert len(broker.closes) == 1                          # the healthy structure closed
+    assert broker.closes[0][0].underlying == "SPY"
+    assert any("management error on QQQ" in w for w in result.warnings)
 
 
 async def test_an_unpriceable_leg_blocks_the_close_loudly(no_lock, monkeypatch):
