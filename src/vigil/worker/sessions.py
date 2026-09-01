@@ -84,6 +84,24 @@ log = get_logger(__name__)
 HALT_FLAG = _HALT_FLAG
 FLATTEN_FLAG = _FLATTEN_FLAG
 
+# Cancelling a structure's resting target only *requests* the cancel; the broker
+# moves the order through `pending_cancel` before `canceled`, and the leg quantity
+# stays reserved (`held_for_orders`) until it lands there. So `_close_structure`
+# polls the order to a terminal state before submitting its close. The poll is
+# bounded on purpose: it runs inside the manage sweep and inside the 15:40 flatten,
+# the two cycles that must always finish, so a target that never settles has to
+# defer the close rather than hang the loop. Worst case here is
+# `_CANCEL_SETTLE_ATTEMPTS - 1` pauses ≈ 1.25s per structure — negligible against a
+# 15-minute sweep, tolerable inside the flatten's 20-minute window.
+_CANCEL_SETTLE_ATTEMPTS = 6
+_CANCEL_SETTLE_PAUSE = 0.25  # seconds between polls
+
+# A resting target releases its reserved legs the moment it leaves the working set,
+# whichever way that happens — an operator cancel, an end-of-day expiry, a broker
+# rejection. Any of these frees the quantity the close needs; `filled` is handled
+# separately because it means the structure is already gone.
+_TARGET_FREED = frozenset({"canceled", "expired", "rejected"})
+
 
 @dataclass(slots=True)
 class CycleResult:
@@ -262,6 +280,37 @@ async def reconcile(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruct
 # manage — the sweep, and the orders it produces
 # --------------------------------------------------------------------------- #
 
+async def _await_target_settled(ctx: RunnerContext, order_id: str) -> str:
+    """Poll a just-cancelled resting target to a terminal state. Bounded.
+
+    Returns one of:
+      * ``"freed"``    — the order left the working set (``canceled``/``expired``/
+        ``rejected``); its legs are released, so the close may be submitted.
+      * ``"filled"``   — the target filled first, which already closed the
+        structure; the caller must **not** submit a competing close.
+      * ``"deferred"`` — it never reached a terminal state within the budget; the
+        close is skipped this cycle and retried next sweep.
+
+    The first read happens with no pause, so a broker that cancels synchronously
+    (and the test stub that models it) settles on attempt zero. A pause is taken
+    only *between* reads, never after the last — an unsettled cancel costs at most
+    ``_CANCEL_SETTLE_ATTEMPTS - 1`` pauses, then defers.
+    """
+    for attempt in range(_CANCEL_SETTLE_ATTEMPTS):
+        status = await ctx.broker.order_status(order_id)
+        if status == "filled":
+            return "filled"
+        if status in _TARGET_FREED:
+            return "freed"
+        # pending_cancel / pending_new / new / accepted / partially_filled: the
+        # cancel is still in flight (or the target is mid-fill), so the legs may
+        # still be reserved. Wait a beat and re-read rather than racing a submit
+        # against a held leg — the failure this whole poll exists to prevent.
+        if attempt + 1 < _CANCEL_SETTLE_ATTEMPTS:
+            await asyncio.sleep(_CANCEL_SETTLE_PAUSE)
+    return "deferred"
+
+
 async def _close_structure(
     ctx: RunnerContext, decision: ManagementDecision, result: CycleResult
 ) -> bool:
@@ -298,12 +347,57 @@ async def _close_structure(
     leg_symbols = set(symbols)
     try:
         for r in await ctx.broker.resting_orders():
-            if r.is_closing and leg_symbols <= r.symbols:
-                await ctx.broker.cancel_order(r.order_id)
-                result.note(
-                    f"cancelled resting target {r.order_id[:8]} on "
-                    f"{s.underlying} {s.expiry} before close"
+            if not (r.is_closing and leg_symbols <= r.symbols):
+                continue
+            await ctx.broker.cancel_order(r.order_id)
+            # A cancel is only a *request*: the target sits in `pending_cancel`
+            # with its legs still reserved until the broker settles it, so submitting
+            # the close now would race that and be rejected for insufficient quantity
+            # — the exact failure the cancel-first ordering was meant to fix, still
+            # live because the ordering alone does not wait. Poll to a terminal state.
+            settled = await _await_target_settled(ctx, r.order_id)
+            if settled == "filled":
+                # The resting profit target filled while we were cancelling it, which
+                # already closed this structure (§2.6). A close submitted now would
+                # trade against a position that no longer exists — at best a rejected
+                # order, at worst a brand-new, possibly naked, structure (hard rule
+                # #3). So submit nothing: record the close the target performed and
+                # stop. The next reconcile reads the flat book back (§2.3).
+                await J.close_structure(
+                    ctx.db, underlying=s.underlying, expiry=s.expiry,
+                    reason=f"resting target filled ahead of {decision.reason}",
                 )
+                result.closed += 1
+                result.note(
+                    f"{s.underlying} {s.expiry} closed by its resting target "
+                    f"{r.order_id[:8]} before the manage close could submit"
+                )
+                log.info(
+                    "structure.target_filled_during_close",
+                    underlying=s.underlying, expiry=str(s.expiry), order_id=r.order_id,
+                )
+                return True
+            if settled == "deferred":
+                # The cancel never reached a terminal state within the poll budget,
+                # so the legs may still be reserved and a close would race it. Defer
+                # rather than hang the sweep (or the flatten): loud warning, no submit,
+                # safe retry next cycle — the cancel is idempotent. The position stays
+                # covered by the 15:40 flatten and the breach rule meanwhile.
+                result.warnings.append(
+                    f"CLOSE DEFERRED {s.underlying} {s.expiry}: resting target "
+                    f"{r.order_id[:8]} did not settle after cancel; not closed this "
+                    f"cycle. The 15:40 flatten and breach rule still cover it."
+                )
+                log.warning(
+                    "structure.close_deferred",
+                    underlying=s.underlying, expiry=str(s.expiry), order_id=r.order_id,
+                )
+                return False
+            # settled == "freed": the reservation is released; safe to close.
+            result.note(
+                f"cancelled resting target {r.order_id[:8]} on "
+                f"{s.underlying} {s.expiry} before close"
+            )
         order = await ctx.broker.submit_close(s, limit, reason=decision.reason)
     except Exception as exc:  # noqa: BLE001 — an unclosable position is the worst thing in the book
         # Degrade to a loud warning rather than let the error abort the sweep (the

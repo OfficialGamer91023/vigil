@@ -109,6 +109,7 @@ class StubBroker:
         spot: Decimal = Decimal("760.00"),
         resting: list[RestingOrder] | None = None,
         close_error: bool = False,
+        target_settle: str = "canceled",
     ) -> None:
         self._structures = structures
         self._equity = equity
@@ -124,6 +125,14 @@ class StubBroker:
         # When True, every close submit raises — for the sweep-hardening test, where
         # the point is that one structure's failure must not abort the others.
         self._close_error = close_error
+        # How a cancelled resting target settles when the close polls it — the async
+        # cancel a real cancel-then-close must wait out (§2.6):
+        #   "canceled" — settles at once and frees the legs (the healthy default).
+        #   "filled"   — the target filled before the cancel took, so the structure
+        #                is already closed and no competing close may be sent.
+        #   "pending"  — never settles; the close must defer rather than hang.
+        self._target_settle = target_settle
+        self.status_polls: list[str] = []
 
     @property
     def client(self):
@@ -156,9 +165,18 @@ class StubBroker:
 
     async def cancel_order(self, order_id: str) -> None:
         self.cancelled.append(order_id)
-        # Cancelling frees the reserved quantity — model that by dropping the order,
-        # so a subsequent close of the same legs is no longer blocked.
-        self._resting = [r for r in self._resting if r.order_id != order_id]
+        # Only a cancel that actually settles frees the reserved quantity. Model
+        # that by dropping the order — but *only* on the "canceled" path, so the
+        # "filled"/"pending" cases keep the legs held and the close's settle-poll
+        # has something real to react to.
+        if self._target_settle == "canceled":
+            self._resting = [r for r in self._resting if r.order_id != order_id]
+
+    async def order_status(self, order_id: str) -> str:
+        # The status the close's bounded poll reads back after cancelling a target.
+        self.status_polls.append(order_id)
+        return {"canceled": "canceled", "filled": "filled",
+                "pending": "pending_cancel"}[self._target_settle]
 
     async def submit_close(self, structure, limit_price, *, reason, good_till_cancelled=False):
         if self._close_error:
@@ -371,9 +389,76 @@ async def test_a_breached_structure_cancels_its_resting_target_before_closing(
         await S.run_manage(ctx, result)
 
     assert broker.cancelled == [f"rest-{structure.underlying}"]   # target freed first
+    assert broker.status_polls == [f"rest-{structure.underlying}"]  # and polled to terminal
     assert len(broker.closes) == 1                                # and the close went through
     assert result.closed == 1
     assert not result.warnings
+
+
+async def test_a_resting_target_that_fills_during_cancel_is_not_double_closed(
+    no_lock, monkeypatch
+):
+    """The naked-leg trap. A resting GTC target is a 50%-profit exit, so it can
+    *fill* in the instant we try to cancel it — which already closed the structure
+    (§2.6). If the close were then submitted it would trade against a position that
+    no longer exists: at best a rejected order, at worst a brand-new, possibly naked
+    structure (hard rule #3). The settle-poll must see `filled` and submit nothing,
+    recording the close the target performed instead."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),                       # breached → the sweep wants it closed
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        resting=[resting_for(structure)],
+        target_settle="filled",                  # the target fills before the cancel takes
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        rows = await J.open_structure_rows(db)
+
+    assert broker.closes == []                   # no competing close was submitted
+    assert result.closed == 1                    # but the structure is booked closed
+    assert rows == []                            # and gone from the registry
+    assert not result.warnings
+
+
+async def test_a_cancel_that_never_settles_defers_the_close_without_hanging(
+    no_lock, monkeypatch
+):
+    """The bounded-poll safety valve. If a target's cancel never reaches a terminal
+    state, its legs may still be reserved and a close would race it — but the manage
+    sweep (and the 15:40 flatten) must always finish. So the poll caps its attempts
+    and degrades to a loud CLOSE DEFERRED: no submit, sweep completes, retry next
+    cycle. The position stays covered by the flatten and the breach rule meanwhile.
+    Pauses are zeroed so the bound is asserted, not waited out."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CANCEL_SETTLE_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        resting=[resting_for(structure)],
+        target_settle="pending",                 # cancel requested but never settles
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)          # must return, not hang
+
+    assert broker.closes == []                                     # nothing submitted
+    assert result.closed == 0
+    assert len(broker.status_polls) == S._CANCEL_SETTLE_ATTEMPTS   # polled to the cap
+    assert any("CLOSE DEFERRED" in w for w in result.warnings)
 
 
 async def test_a_failed_close_submit_degrades_to_a_warning(no_lock, monkeypatch):

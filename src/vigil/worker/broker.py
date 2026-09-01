@@ -238,6 +238,26 @@ class Broker:
     async def cancel_order(self, order_id: str) -> None:
         await asyncio.to_thread(self.client.cancel_order_by_id, order_id)
 
+    async def order_status(self, order_id: str) -> str:
+        """One order's current status, lowercased — the read the close waits on.
+
+        `cancel_order` only *requests* a cancel: the order moves through
+        `pending_cancel` (and a fresh close through `pending_new`) before it
+        reaches a terminal state, and the leg quantity stays reserved
+        (`held_for_orders`) until it does. `_close_structure` polls this so it
+        submits its close only once the resting target's reservation is actually
+        released — or discovers the target `filled` first, which already closed
+        the structure and means no competing close may be sent.
+
+        Returned as the bare status string rather than the SDK enum so the caller
+        (in `sessions.py`) compares against plain values and needs no alpaca-py
+        import — the same reduction `_as_resting` does for the reconcile path.
+        """
+        order: Order = _model(
+            await asyncio.to_thread(self.client.get_order_by_id, order_id)
+        )
+        return str(getattr(order.status, "value", order.status)).lower()
+
     async def cancel_all_orders(self) -> None:
         await asyncio.to_thread(self.client.cancel_orders)
 
