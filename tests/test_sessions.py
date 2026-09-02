@@ -523,6 +523,49 @@ async def test_a_cancel_that_never_settles_defers_the_close_without_hanging(
     assert result.closed == 0
     assert len(broker.status_polls) == S._CANCEL_SETTLE_ATTEMPTS   # polled to the cap
     assert any("CLOSE DEFERRED" in w for w in result.warnings)
+    # And because a covering §2.6 target still reserves the legs (the cancel never
+    # took), the targetless-guard must NOT place a second one.
+    assert not any("re-rested" in n for n in result.notes)
+
+
+async def test_a_close_that_strips_a_target_it_cannot_replace_re_rests_it(
+    no_lock, monkeypatch
+):
+    """§2.6-persistent fix: never leave a structure without an exit after a failed close.
+
+    When a close cancels a structure's target but cannot complete, and no covering
+    target remains, the guard re-rests one **in the same cycle** rather than leaving
+    the position bare until a future sweep — the reconcile→re-rest latency the soak's
+    §2.6-persistent audit was catching. Exercised directly on `_ensure_target` with a
+    book that holds no covering resting order."""
+    monkeypatch.setattr(S, "_TARGET_LIVE_PAUSE", 0.0)
+    structure = make_structure(has_target=False)
+    broker = StubBroker(structures=(structure,), resting=[])   # nothing covers the legs
+    async with get_session() as db:
+        await J.record_structure(db, structure)                # so the target can link
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S._ensure_target(ctx, structure, result)
+        orders = (await db.scalars(select(OrderRow).where(OrderRow.intent == "target"))).all()
+
+    assert len(broker.closes) == 1                             # a fresh GTC target rested
+    _, _, reason, gtc = broker.closes[0]
+    assert gtc is True and "rerest" in reason
+    assert len(orders) == 1 and orders[0].structure_id is not None   # linked, not orphaned
+
+
+async def test_the_targetless_guard_does_not_duplicate_a_live_target(no_lock):
+    """The safety half of the guard: if a covering §2.6 target still reserves the legs
+    (the cancel did not actually take), re-resting would leave two exits for a
+    position that can honour one. So `_ensure_target` must place nothing."""
+    structure = make_structure()
+    broker = StubBroker(structures=(structure,), resting=[resting_for(structure)])
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S._ensure_target(ctx, structure, result)
+
+    assert broker.closes == []                                # no second target placed
 
 
 async def test_a_failed_close_submit_degrades_to_a_warning(no_lock, monkeypatch):

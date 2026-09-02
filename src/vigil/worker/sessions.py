@@ -55,7 +55,13 @@ from vigil.control import FLATTEN_FLAG as _FLATTEN_FLAG
 from vigil.control import HALT_FLAG as _HALT_FLAG
 from vigil.db.repositories import journal as J
 from vigil.db.session import get_session
-from vigil.domain import KernelDecision, OpenStructure, PortfolioState, TradeProposal
+from vigil.domain import (
+    KernelDecision,
+    OpenStructure,
+    PortfolioState,
+    PositionLeg,
+    TradeProposal,
+)
 from vigil.execution.manage import (
     Action,
     ManagementDecision,
@@ -646,6 +652,11 @@ async def _close_structure(
                     "structure.close_deferred",
                     underlying=s.underlying, expiry=str(s.expiry), order_id=r.order_id,
                 )
+                # The target was cancelled but the close did not happen — the exact
+                # window the soak's §2.6-persistent audit catches. Re-rest a target
+                # (only if none still covers the legs) so the structure is never left
+                # without an exit for the cycle the auditor reads next.
+                await _ensure_target(ctx, s, result)
                 return False
             # settled == "freed": the reservation is released; safe to close.
             result.note(
@@ -668,6 +679,9 @@ async def _close_structure(
             "structure.close_failed",
             underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
         )
+        # The submit failed, possibly after the target was already cancelled above —
+        # so the structure may be sitting with no exit. Re-rest one if none covers it.
+        await _ensure_target(ctx, s, result)
         return False
 
     # Link the close to the structure it closes (reconcile registered the row at
@@ -774,9 +788,36 @@ async def _replace_target(
     raises the alarm. When it *can* price the target we place a real GTC exit and
     let the next reconcile read it back from the broker (§2.3: broker is truth).
     """
-    s = decision.structure
-    target = resting_target_price(s, ctx.strategy)
-    if target is None:
+    await _rerest_target(ctx, decision.structure, result)
+
+
+async def _rerest_target(
+    ctx: RunnerContext,
+    s: OpenStructure,
+    result: CycleResult,
+    *,
+    target: Decimal | None = None,
+    verify: bool = False,
+) -> bool:
+    """Price and rest a fresh GTC profit target for `s`; return whether one was placed.
+
+    The single place a §2.6 exit is (re)placed outside the entry router. Three
+    callers share it: the sweep's defect repair (`_replace_target`), the guard that
+    fires when a close cancels a target but cannot complete (`_ensure_target`), and
+    the entry path confirming its just-placed target actually went live.
+
+    `target` lets a caller that already knows the price reuse it (the entry path
+    passes the price the router just rested at); otherwise it is priced from the
+    reconciled credit, and `None` there — an adopted position we never priced —
+    keeps the alarm rather than guessing (`resting_target_price` returns `None`).
+
+    `verify` polls the placed order to a live state and warns if it stalled in
+    `pending_new`: the callers closing a real risk window want that confirmation;
+    the routine sweep repair is content to let the next reconcile read it back
+    (§2.3: broker is truth).
+    """
+    price = target if target is not None else resting_target_price(s, ctx.strategy)
+    if price is None:
         # No trustworthy opening credit — keep the alarm rather than guess a price.
         result.warnings.append(
             f"§2.6 DEFECT unrepaired: {s.underlying} {s.expiry} has no resting exit "
@@ -787,11 +828,11 @@ async def _replace_target(
             "structure.no_resting_target",
             underlying=s.underlying, expiry=str(s.expiry), reason="unknown opening credit",
         )
-        return
+        return False
 
     try:
         order = await ctx.broker.submit_close(
-            s, target, reason="rerest resting profit target", good_till_cancelled=True
+            s, price, reason="rerest resting profit target", good_till_cancelled=True
         )
     except Exception as exc:  # noqa: BLE001 — a missing exit is serious; surface any failure
         # An unclosable/unprotectable position is the worst thing in the book, so a
@@ -805,7 +846,7 @@ async def _replace_target(
             "structure.rerest_failed",
             underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
         )
-        return
+        return False
 
     # Link the re-rested target to its structure (the row exists — this is the
     # repair of a structure reconcile already registered this sweep).
@@ -816,7 +857,7 @@ async def _replace_target(
         broker_order_id=str(order.id),
         structure_id=structure_id,
         intent="target",
-        limit_price=target,
+        limit_price=price,
         qty=s.contracts,
         status=str(getattr(order.status, "value", order.status)),
     )
@@ -828,12 +869,56 @@ async def _replace_target(
     # only keeps the journal honest in the interim.
     await J.record_structure(ctx.db, replace(s, has_resting_target=True))
     result.note(
-        f"re-rested resting target for {s.underlying} {s.expiry} @ {target} (§2.6 repair)"
+        f"re-rested resting target for {s.underlying} {s.expiry} @ {price} (§2.6 repair)"
     )
     log.info(
         "structure.rerest",
-        underlying=s.underlying, expiry=str(s.expiry), target=str(target),
+        underlying=s.underlying, expiry=str(s.expiry), target=str(price),
     )
+    if verify:
+        # Confirm it actually went live rather than stalling in `pending_new` — the
+        # same check the entry path uses. A stall is surfaced; the next reconcile
+        # re-checks and re-rests, so this never silently "looks repaired".
+        live = await _await_target_live(ctx, str(order.id))
+        if live != "live":
+            result.warnings.append(
+                f"§2.6 re-rested target for {s.underlying} {s.expiry} did not confirm "
+                f"live ({live}); reconcile will re-check next cycle."
+            )
+    return True
+
+
+async def _ensure_target(ctx: RunnerContext, s: OpenStructure, result: CycleResult) -> None:
+    """Never leave `s` without a resting exit after a close cancelled its target.
+
+    The close path cancels a structure's §2.6 target before submitting its close
+    (the target reserves the legs). When that close then cannot complete — the
+    cancel does not settle in the poll budget, or the submit fails — the structure
+    is left with its target gone and no close in flight: a §2.6 defect that,
+    holding across the next audit, is the reconcile→re-rest *latency* the soak
+    catches. This closes that window in the same cycle.
+
+    Re-rests **only if no covering §2.6 target still reserves the legs**. A `gtc`
+    closing order on these legs is a resting target (a `day` one is a working
+    close); if one is still there the cancel did not actually take, and re-resting
+    would leave two exits for a position that can honour one. The read is defensive:
+    a broker error here must not mask the close failure that brought us here.
+    """
+    try:
+        leg_symbols = {leg.symbol for leg in s.legs}
+        covering = [
+            r for r in await ctx.broker.resting_orders()
+            if r.is_closing and not _is_management_close(r) and leg_symbols <= r.symbols
+        ]
+    except Exception as exc:  # noqa: BLE001 — the re-rest is best-effort recovery
+        log.warning(
+            "structure.ensure_target_read_failed",
+            underlying=s.underlying, expiry=str(s.expiry), error=str(exc)[:200],
+        )
+        return
+    if covering:
+        return  # a resting target still protects it; do not place a second
+    await _rerest_target(ctx, s, result, verify=True)
 
 
 async def run_manage(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStructure, ...]:
@@ -1367,15 +1452,51 @@ async def _submit(
         # stall is surfaced loudly so the next reconcile's §2.6 repair picks it up.
         live = await _await_target_live(ctx, str(outcome.target_order.id))
         if live != "live":
-            result.warnings.append(
-                f"§2.6 target for {proposal.underlying} {proposal.expiry} did not go "
-                f"live ({live}); the position has no confirmed resting exit. Reconcile "
-                f"will re-rest it next cycle. The 15:40 time stop covers it meanwhile."
+            # The just-rested target never went live (stalled in `pending_new`, or
+            # rejected), so the fresh position is unprotected. Do not yield the entry
+            # that way: cancel the dead ticket and re-rest a fresh GTC target at the
+            # same price, verified, before returning — the entry-side of the same
+            # "never leave a structure without an exit" guarantee the manage path now
+            # enforces. Build the closing view from the proposal, which is what the
+            # sweep would otherwise reconstruct from the broker a cycle later.
+            filled = outcome.filled_contracts or proposal.contracts
+            try:
+                await ctx.broker.cancel_order(str(outcome.target_order.id))
+            except Exception as exc:  # noqa: BLE001 — best-effort; re-rest is what matters
+                log.warning(
+                    "structure.stalled_target_cancel_failed",
+                    underlying=proposal.underlying, expiry=str(proposal.expiry),
+                    error=str(exc)[:200],
+                )
+            structure = OpenStructure(
+                underlying=proposal.underlying,
+                expiry=proposal.expiry,
+                strikes=tuple(leg.occ.strike for leg in proposal.legs),
+                max_loss=proposal.max_loss_per_contract * filled,
+                dollar_delta=Decimal(0),
+                net_credit=proposal.net_credit,
+                contracts=filled,
+                legs=tuple(
+                    PositionLeg(symbol=leg.symbol, ratio_qty=leg.ratio_qty, is_short=leg.is_short)
+                    for leg in proposal.legs
+                ),
             )
-            log.warning(
-                "structure.target_not_live",
-                underlying=proposal.underlying, expiry=str(proposal.expiry), outcome=live,
+            # Reuse the price the router already rested at; fall back to pricing from
+            # the credit if it was unknown (0 → `None` lets `_rerest_target` derive it).
+            known = Decimal(str(outcome.target_order.limit_price or 0))
+            placed = await _rerest_target(
+                ctx, structure, result, target=known or None, verify=True
             )
+            if not placed:
+                result.warnings.append(
+                    f"§2.6 target for {proposal.underlying} {proposal.expiry} did not go "
+                    f"live ({live}) and could not be re-rested; the 15:40 time stop and "
+                    f"breach rule cover it, and reconcile retries next cycle."
+                )
+                log.warning(
+                    "structure.target_not_live",
+                    underlying=proposal.underlying, expiry=str(proposal.expiry), outcome=live,
+                )
 
     if not outcome.filled:
         result.note(f"no fill after {outcome.rungs_used} rung(s) — {outcome.note}")
