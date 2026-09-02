@@ -111,8 +111,13 @@ class StubBroker:
         close_error: bool = False,
         target_settle: str = "canceled",
         close_fill: str = "filled",
+        order_statuses: list[tuple[str, str, str]] | None = None,
     ) -> None:
         self._structures = structures
+        # (broker_order_id, client_order_id, status) the reconcile scan writes back
+        # to the journal (§5.2). Empty by default — most tests do not exercise the
+        # writeback — and set explicitly by the test that does.
+        self._order_statuses = order_statuses or []
         self._equity = equity
         self.quotes_by_symbol = quotes or {}
         self._spot = spot
@@ -163,6 +168,9 @@ class StubBroker:
     async def structures(self) -> tuple[OpenStructure, ...]:
         return self._structures
 
+    async def order_statuses(self) -> list[tuple[str, str, str]]:
+        return list(self._order_statuses)
+
     async def spot(self, underlying: str) -> Decimal:
         return self._spot
 
@@ -197,7 +205,7 @@ class StubBroker:
         if order_id in self._close_order_ids:
             self.close_polls.append(order_id)
             return {"filled": "filled", "working": "accepted",
-                    "rejected": "rejected"}[self._close_fill]
+                    "rejected": "rejected", "stalled": "pending_new"}[self._close_fill]
         self.status_polls.append(order_id)
         return {"canceled": "canceled", "filled": "filled",
                 "pending": "pending_cancel"}[self._target_settle]
@@ -641,6 +649,125 @@ async def test_an_unfilled_close_leaves_the_structure_closing_not_closed(
     assert [r.status for r in rows] == ["open"]         # the registry still holds it
     assert "1 closing" in result.summary
     assert not result.warnings
+
+
+async def test_a_close_stuck_in_pending_new_is_flagged_stalled_not_counted_working(
+    no_lock, monkeypatch
+):
+    """§5.2: a close the broker never routes (`pending_new`) is not "closing in flight".
+
+    The defect this whole trace was about: a close stalled in `pending_new` was
+    lumped in with `new`/`accepted` and counted as a working close, so the sweep
+    left a dead order over the position and never resubmitted. It must instead be
+    called out loudly and *not* counted as closing — the structure stays open so
+    the next sweep sends a fresh close."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CLOSE_FILL_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),                       # breached
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+        close_fill="stalled",                    # the close never leaves pending_new
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        rows = (await db.scalars(select(OpenStructureRow))).all()
+
+    assert len(broker.closes) == 1
+    assert result.closed == 0
+    assert result.closing == 0                          # NOT counted as closing in flight
+    assert [r.status for r in rows] == ["open"]         # still open, retried next sweep
+    assert any("CLOSE STALLED" in w for w in result.warnings)
+
+
+async def test_a_submitted_close_is_linked_to_its_structure(no_lock, monkeypatch):
+    """§5.2 linkage: the close order carries its parent `structure_id`, not NULL.
+
+    The orphaned-order defect — every management close recorded with
+    `structure_id` NULL — is what made the churn invisible to any query joining
+    orders to structures. The row reconcile registered at the top of the sweep is
+    the one the close must point at."""
+    monkeypatch.setattr(S, "now_et", lambda: MID_SESSION)
+    monkeypatch.setattr(S, "_CLOSE_FILL_PAUSE", 0.0)
+    structure = make_structure(expiry=MID_SESSION.date() + timedelta(days=1))
+    broker = StubBroker(
+        structures=(structure,),
+        spot=Decimal(750),                       # breached → close
+        quotes={
+            structure.legs[0].symbol: (Decimal("5.00"), Decimal("5.10")),
+            structure.legs[1].symbol: (Decimal("4.20"), Decimal("4.30")),
+        },
+    )
+    async with get_session() as db:
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.run_manage(ctx, result)
+        order = (await db.scalars(select(OrderRow).where(OrderRow.intent == "close"))).one()
+        srow = (await db.scalars(select(OpenStructureRow))).one()
+
+    assert order.structure_id == srow.id                # linked, not orphaned
+
+
+async def test_reconcile_writes_live_order_status_back_to_the_journal(no_lock):
+    """§5.2 writeback: reconcile advances a row past its submit-time `pending_new`.
+
+    A ticket's row is written once, as `pending_new`, and — until this scan — never
+    again, which is why 31 closes read `pending_new` in the DB regardless of what
+    they did. Recording an order frozen at `pending_new`, then reconciling against a
+    broker that reports it live, must leave the journal reading the live status."""
+    structure = make_structure()
+    async with get_session() as db:
+        # A ticket the journal recorded at submit time and never updated.
+        await J.record_order(
+            db, client_order_id="vigil-test-tgt", broker_order_id="brk-1",
+            intent="target", limit_price=Decimal("0.10"), qty=1, status="pending_new",
+        )
+        broker = StubBroker(
+            structures=(structure,),
+            order_statuses=[("brk-1", "vigil-test-tgt", "held")],   # broker says it is live
+        )
+        ctx = await _context(broker, db)
+        result = S.CycleResult(kind=CycleKind.MANAGE)
+        await S.reconcile(ctx, result)
+        row = (
+            await db.scalars(select(OrderRow).where(OrderRow.client_order_id == "vigil-test-tgt"))
+        ).one()
+
+    assert row.status == "held"                         # no longer frozen at pending_new
+
+
+async def test_await_target_live_reports_a_pending_new_stall(no_lock, monkeypatch):
+    """§2.6: the target confirmation poll calls a `pending_new` target a stall.
+
+    A resting GTC target that never advances past `pending_new` protects nothing —
+    the "resting target MISSING" the desk showed. The poll must distinguish that
+    from a healthy `held` target and persist whatever it saw."""
+    monkeypatch.setattr(S, "_TARGET_LIVE_PAUSE", 0.0)
+
+    class _PendingBroker(StubBroker):
+        async def order_status(self, order_id: str) -> str:
+            return "pending_new"
+
+    async with get_session() as db:
+        await J.record_order(
+            db, client_order_id="vigil-test-tgt2", broker_order_id="brk-2",
+            intent="target", limit_price=Decimal("0.10"), qty=1, status="pending_new",
+        )
+        broker = _PendingBroker()
+        ctx = await _context(broker, db)
+        outcome = await S._await_target_live(ctx, "brk-2")
+        row = (
+            await db.scalars(select(OrderRow).where(OrderRow.broker_order_id == "brk-2"))
+        ).one()
+
+    assert outcome == "stalled"
+    assert row.status == "pending_new"                  # the poll persisted what it saw
 
 
 async def test_a_working_close_is_not_resubmitted_or_re_rested_next_sweep(

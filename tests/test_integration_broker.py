@@ -142,6 +142,11 @@ class FakeBroker:
     def __init__(self, client: FakeOrderClient) -> None:
         self.client = client
 
+    async def order_status(self, order_id: str) -> str:
+        # The resting profit target the router places on every fill went live and is
+        # working — the healthy §2.6 shape the target-confirmation poll expects.
+        return "held"
+
     async def submit_entry(
         self,
         proposal: TradeProposal,
@@ -422,6 +427,10 @@ class SenseBroker:
 
     async def structures(self) -> tuple:
         return self._structures
+
+    async def order_statuses(self) -> list[tuple[str, str, str]]:
+        # No working orders to reconcile in these sense→reconcile tests.
+        return []
 
     async def spot(self, underlying: str) -> Decimal:
         return self._spot
