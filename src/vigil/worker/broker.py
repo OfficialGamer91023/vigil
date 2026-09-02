@@ -142,6 +142,26 @@ class Broker:
         raw = await asyncio.to_thread(self.client.get_orders, req)
         return [_model(o) for o in raw]
 
+    async def order_statuses(self) -> list[tuple[str, str, str]]:
+        """`(broker_order_id, client_order_id, status)` for every working order.
+
+        The reconcile scan writes these back to the journal so a ticket's row
+        stops freezing at its submit-time `pending_new` (§5.2). Reduced to plain
+        strings here — the seam rule again: `sessions.py` compares against bare
+        values and never imports an alpaca-py type. Terminal orders (filled,
+        cancelled) drop out of `OPEN` and are caught instead by the poll loops at
+        the moment they settle, so this scan is exactly the live set whose stall
+        in `pending_new` was invisible before.
+        """
+        return [
+            (
+                str(o.id),
+                str(o.client_order_id),
+                str(getattr(o.status, "value", o.status)).lower(),
+            )
+            for o in await self.open_orders()
+        ]
+
     async def resting_orders(self) -> list[RestingOrder]:
         """The working orders at the broker, reduced to what the close path needs.
 

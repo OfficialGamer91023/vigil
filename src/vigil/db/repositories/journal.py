@@ -266,6 +266,29 @@ async def upsert_order_status(
     )
 
 
+async def upsert_order_status_by_broker_id(
+    session: AsyncSession, *, broker_order_id: str, status: str,
+) -> None:
+    """Update a ticket's status keyed on the **broker** order id. Silent no-op if unknown.
+
+    The polling loops (`_await_close_filled`, `_await_target_settled`, the target
+    live-confirmation) hold the broker order id they are polling, not the
+    `client_order_id`, so this is the key they can write against without threading
+    the client id down through every helper. The sibling `upsert_order_status`
+    keys on the client id for the reconcile scan, where the SDK order carries both.
+
+    Both exist because the whole §5.2 defect was that this was *never called* — the
+    order row froze at its submit-time status (`pending_new`) forever. Persisting
+    on every poll is what makes the journal reflect the broker rather than a
+    one-shot guess taken the instant the order was accepted.
+    """
+    await session.execute(
+        update(Order)
+        .where(Order.broker_order_id == broker_order_id)
+        .values(status=status)
+    )
+
+
 async def record_fill(
     session: AsyncSession,
     *,
@@ -380,6 +403,83 @@ async def open_structure_rows(session: AsyncSession) -> list[OpenStructureRow]:
             )
         ).all()
     )
+
+
+async def open_structure_id(
+    session: AsyncSession, *, underlying: str, expiry: date
+) -> int | None:
+    """The id of the open structure row for `(underlying, expiry)`, or ``None``.
+
+    Keyed exactly like `record_structure`/`close_structure` — `(underlying,
+    expiry, status='open')` — so the manage-path order writers can stamp
+    `orders.structure_id` with the row reconcile already created, without holding
+    an ORM object. Returns ``None`` when no open row exists (an order for a
+    structure not yet registered), which the caller records as an unlinked order
+    rather than inventing a row.
+    """
+    row_id: int | None = await session.scalar(
+        select(OpenStructureRow.id).where(
+            OpenStructureRow.underlying == underlying,
+            OpenStructureRow.expiry == expiry,
+            OpenStructureRow.status == "open",
+        )
+    )
+    return row_id
+
+
+async def ensure_open_structure(
+    session: AsyncSession,
+    *,
+    underlying: str,
+    expiry: date,
+    structure_type: str | None,
+    contracts: int,
+    net_credit: Decimal,
+    max_loss: Decimal,
+    proposal_id: int | None = None,
+) -> int:
+    """Register the structure of a just-filled entry, returning its row id.
+
+    Get-or-create on the same `(underlying, expiry, status='open')` key
+    `record_structure` uses, so it is idempotent with the reconcile that will
+    refresh this row from broker truth on the next cycle (§2.3). It exists because
+    the entry flow records an `open` order and its resting `target` *before* any
+    structure row is created — reconcile only mints one on the following cycle —
+    so those two tickets had nothing to link to and were journalled orphaned
+    (`structure_id` NULL). Registering on the fill both closes that gap and lets
+    Gate 5/6 count the position the moment it exists rather than a cycle late.
+
+    Takes primitives rather than an `OpenStructure` because a `TradeProposal` is
+    not one, and constructing a full `OpenStructure` (split short strikes, dollar
+    delta) here would duplicate `reconcile.group_positions` for no gain — reconcile
+    fills those fields in from broker truth next cycle regardless.
+    """
+    row = await session.scalar(
+        select(OpenStructureRow).where(
+            OpenStructureRow.underlying == underlying,
+            OpenStructureRow.expiry == expiry,
+            OpenStructureRow.status == "open",
+        )
+    )
+    if row is None:
+        row = OpenStructureRow(
+            proposal_id=proposal_id,
+            underlying=underlying,
+            expiry=expiry,
+            structure_type=structure_type,
+            contracts=contracts,
+            net_credit=net_credit,
+            max_loss=max_loss,
+            has_resting_target=True,  # the router rests a target on every fill (§2.6)
+        )
+        session.add(row)
+    else:
+        # Already registered (a same-underlying/expiry refresh): keep the row, do
+        # not clobber broker-reconciled fields. Only fill provenance we now know.
+        if proposal_id is not None:
+            row.proposal_id = proposal_id
+    await session.flush()
+    return row.id
 
 
 # --------------------------------------------------------------------------- #

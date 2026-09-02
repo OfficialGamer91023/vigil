@@ -121,6 +121,30 @@ _CLOSE_FILL_PAUSE = 0.25  # seconds between polls
 # again, handled separately: it is the one terminal state that did close it.
 _CLOSE_UNFILLED = frozenset({"canceled", "expired", "rejected", "done_for_day"})
 
+# `pending_new` is Alpaca's *pre-acceptance* limbo: the order was received but has
+# not been routed to the venue. A healthy order leaves it in well under a second for
+# `new`/`accepted`/`held`. An order still here after the whole poll budget never went
+# live — the §5.2 defect that stalled every management close and profit target while
+# the code counted it as "working" and moved on. It is called out by name so a stall
+# reads as an anomaly rather than hiding among the legitimately-resting states.
+_PENDING_NEW = "pending_new"
+
+# The states that mean an order is genuinely *live and working* at the venue — as
+# opposed to `pending_new` (not yet live) or a terminal state. A resting GTC profit
+# target sits in `new`/`held` indefinitely and that is the healthy shape, so these
+# are what the target live-confirmation waits to see before it trusts the exit.
+_LIVE_WORKING = frozenset(
+    {"new", "accepted", "held", "partially_filled", "pending_cancel", "pending_replace", "replaced"}
+)
+
+# The target live-confirmation poll (§2.6): after resting a GTC profit target, poll
+# it briefly to confirm it actually reached a live state rather than stalling in
+# `pending_new`. Same shape and budget as the close-fill poll — best-effort, bounded,
+# runs on the entry path — because an unconfirmed target is surfaced as a defect the
+# next reconcile re-checks, never waited on here.
+_TARGET_LIVE_ATTEMPTS = 3
+_TARGET_LIVE_PAUSE = 0.25  # seconds between polls
+
 # How far a still-resting management close must have drifted from the price we would
 # submit *now* before it is worth cancelling and repricing. Below this, the resting
 # close is left to fill — cancelling and re-submitting it every five minutes is the
@@ -293,6 +317,19 @@ async def reconcile(ctx: RunnerContext, result: CycleResult) -> tuple[OpenStruct
     structures = await ctx.broker.structures()
     for s in structures:
         await J.record_structure(ctx.db, s)
+
+    # Write every live order's current broker status back to its journal row (§5.2).
+    # A ticket's row is written once at submit time — as `pending_new` — and, until
+    # this scan existed, never again: the reason 31 closes and 5 targets all read
+    # `pending_new` in the DB regardless of what they actually did. This catches the
+    # `pending_new` → `new`/`held`/`accepted` transition a healthy order makes
+    # between cycles; a stall that never makes it shows up here as a row still
+    # `pending_new` against a live order, now visibly rather than by inference.
+    for broker_id, coid, status in await ctx.broker.order_statuses():
+        await J.upsert_order_status(
+            ctx.db, client_order_id=coid, status=status, broker_order_id=broker_id
+        )
+
     vanished = await J.mark_absent_structures_closed(
         ctx.db, structures, reason="absent at reconcile (resting target filled, or closed)"
     )
@@ -333,6 +370,10 @@ async def _await_target_settled(ctx: RunnerContext, order_id: str) -> str:
     """
     for attempt in range(_CANCEL_SETTLE_ATTEMPTS):
         status = await ctx.broker.order_status(order_id)
+        # Persist what the broker actually reports, so the journal tracks the
+        # cancel through `pending_cancel` → terminal instead of freezing at the
+        # status recorded when the order was first written (§5.2).
+        await J.upsert_order_status_by_broker_id(ctx.db, broker_order_id=order_id, status=status)
         if status == "filled":
             return "filled"
         if status in _TARGET_FREED:
@@ -346,6 +387,39 @@ async def _await_target_settled(ctx: RunnerContext, order_id: str) -> str:
     return "deferred"
 
 
+async def _await_target_live(ctx: RunnerContext, order_id: str) -> str:
+    """Confirm a just-rested profit target actually went live at the broker (§2.6).
+
+    `_rest_profit_target` submits the GTC target and returns the order as the
+    broker first acknowledged it — which is `pending_new`, *not yet live*. Nothing
+    then confirmed it advanced, so a target that stuck in `pending_new` looked
+    rested while protecting nothing: precisely the §2.6 "resting target MISSING"
+    the desk showed. This closes that gap on the entry path.
+
+    Returns one of:
+      * ``"live"``     — reached `new`/`held`/etc. (or `filled`): the exit is
+        really working at the broker.
+      * ``"stalled"``  — still `pending_new` after the whole budget: it never went
+        live, so the structure has no working exit and the caller must say so.
+      * ``"gone"``     — terminated without ever going live (rejected/cancelled).
+
+    Persists the observed status each read like the other polls, so whatever it
+    finds, the journal reflects it rather than the submit-time guess.
+    """
+    last = ""
+    for attempt in range(_TARGET_LIVE_ATTEMPTS):
+        status = await ctx.broker.order_status(order_id)
+        last = status
+        await J.upsert_order_status_by_broker_id(ctx.db, broker_order_id=order_id, status=status)
+        if status == "filled" or status in _LIVE_WORKING:
+            return "live"
+        if status in _CLOSE_UNFILLED:
+            return "gone"
+        if attempt + 1 < _TARGET_LIVE_ATTEMPTS:
+            await asyncio.sleep(_TARGET_LIVE_PAUSE)
+    return "stalled" if last == _PENDING_NEW else "live"
+
+
 async def _await_close_filled(ctx: RunnerContext, order_id: str) -> str:
     """Poll a just-submitted management close toward a terminal fill. Bounded.
 
@@ -353,12 +427,16 @@ async def _await_close_filled(ctx: RunnerContext, order_id: str) -> str:
       * ``"filled"``  — the close filled; the position is really gone, so the
         structure may be booked closed now. This is the *confirmed terminal fill*
         transition §2.3 asks for, the one the old fire-and-forget path skipped.
-      * ``"working"`` — still live (``new``/``accepted``/``pending_*``/
+      * ``"working"`` — genuinely live (``new``/``accepted``/``held``/
         ``partially_filled``) after the budget. The close is resting at the broker
         and the structure is **closing in flight** — deliberately *not* booked
         closed here. The next reconcile books it once the position is actually
         absent (the 0-open-quantity transition), so a limit that fills a minute
         later is not mistaken for one that never will.
+      * ``"stalled"`` — still ``pending_new`` after the budget: the close never
+        reached the venue, so it is neither filling nor resting. Distinguished from
+        ``"working"`` on purpose (§5.2) — lumping the two is what let a close that
+        went nowhere be counted as one closing in flight.
       * ``"gone"``    — reached a terminal non-fill state; the close will not
         complete, so the structure stays open and is retried next sweep.
 
@@ -366,14 +444,24 @@ async def _await_close_filled(ctx: RunnerContext, order_id: str) -> str:
     broker that fills synchronously settles on attempt zero, and a pause is taken
     only *between* reads.
     """
+    last = ""
     for attempt in range(_CLOSE_FILL_ATTEMPTS):
         status = await ctx.broker.order_status(order_id)
+        last = status
+        # Write the live status back so the row stops freezing at `pending_new`
+        # (§5.2) — the whole reason 31 closes read `pending_new` in the journal.
+        await J.upsert_order_status_by_broker_id(ctx.db, broker_order_id=order_id, status=status)
         if status == "filled":
             return "filled"
         if status in _CLOSE_UNFILLED:
             return "gone"
         if attempt + 1 < _CLOSE_FILL_ATTEMPTS:
             await asyncio.sleep(_CLOSE_FILL_PAUSE)
+    # Budget exhausted. A close still stuck in `pending_new` never went live — it is
+    # not "resting in flight" like a `new`/`accepted` close, and treating it as such
+    # is exactly what let a stalled exit masquerade as a working one. Call it out.
+    if last == _PENDING_NEW:
+        return "stalled"
     return "working"
 
 
@@ -582,10 +670,16 @@ async def _close_structure(
         )
         return False
 
+    # Link the close to the structure it closes (reconcile registered the row at
+    # the top of this sweep, so it exists). Without this the order was orphaned —
+    # `structure_id` NULL — and the churn was invisible to any query joining the
+    # two. `None` only if the row somehow vanished mid-cycle; the order still records.
+    structure_id = await J.open_structure_id(ctx.db, underlying=s.underlying, expiry=s.expiry)
     await J.record_order(
         ctx.db,
         client_order_id=str(order.client_order_id),
         broker_order_id=str(order.id),
+        structure_id=structure_id,
         intent="close",
         limit_price=limit,
         qty=s.contracts,
@@ -624,6 +718,23 @@ async def _close_structure(
         )
         log.warning(
             "structure.close_unfilled",
+            underlying=s.underlying, expiry=str(s.expiry), limit=str(limit),
+        )
+        return False
+    if outcome == "stalled":
+        # Stuck in `pending_new`: the close never reached the venue, so it is
+        # neither filling nor resting. NOT counted as closing-in-flight (that would
+        # suppress a resubmit and leave the position with a dead order over it) —
+        # the structure stays open and the next sweep submits a fresh close. Loud,
+        # because a close that never went live is the §5.2 failure this whole trace
+        # was about. The 15:40 flatten and breach rule still cover it meanwhile.
+        result.warnings.append(
+            f"CLOSE STALLED {s.underlying} {s.expiry}: submitted @ {limit} but the "
+            f"order is still pending_new — it never went live at the broker. Not "
+            f"booked closed; a fresh close is submitted next sweep."
+        )
+        log.warning(
+            "structure.close_stalled",
             underlying=s.underlying, expiry=str(s.expiry), limit=str(limit),
         )
         return False
@@ -696,10 +807,14 @@ async def _replace_target(
         )
         return
 
+    # Link the re-rested target to its structure (the row exists — this is the
+    # repair of a structure reconcile already registered this sweep).
+    structure_id = await J.open_structure_id(ctx.db, underlying=s.underlying, expiry=s.expiry)
     await J.record_order(
         ctx.db,
         client_order_id=str(order.client_order_id),
         broker_order_id=str(order.id),
+        structure_id=structure_id,
         intent="target",
         limit_price=target,
         qty=s.contracts,
@@ -1200,12 +1315,33 @@ async def _submit(
         log.warning("entry.rejected_at_submit", reason=exc.decision.summary)
         return
 
+    # Register the structure the moment a fill confirms, so its entry and resting
+    # target link to it (§5.2). The entry flow used to record both tickets before
+    # any structure row existed — reconcile only mints one next cycle — so both were
+    # journalled orphaned (`structure_id` NULL, seen on the two filled opens). An
+    # unfilled entry has no structure and stays `None`, which is correct.
+    structure_id: int | None = None
+    if outcome.filled and outcome.entry_order is not None:
+        filled = outcome.filled_contracts or proposal.contracts
+        structure_id = await J.ensure_open_structure(
+            ctx.db,
+            underlying=proposal.underlying,
+            expiry=proposal.expiry,
+            structure_type=proposal.structure.value,
+            contracts=filled,
+            net_credit=proposal.net_credit,
+            # Scale to what actually filled, not what we asked for — a partial owns
+            # proportionally less risk, and max_loss_per_contract is the honest unit.
+            max_loss=proposal.max_loss_per_contract * filled,
+        )
+
     entry_row = None
     if outcome.entry_order is not None:
         entry_row = await J.record_order(
             ctx.db,
             client_order_id=str(outcome.entry_order.client_order_id),
             broker_order_id=str(outcome.entry_order.id),
+            structure_id=structure_id,
             intent="open",
             limit_price=proposal.limit_price,
             qty=proposal.contracts,
@@ -1217,11 +1353,29 @@ async def _submit(
             ctx.db,
             client_order_id=str(outcome.target_order.client_order_id),
             broker_order_id=str(outcome.target_order.id),
+            structure_id=structure_id,
             intent="target",
             limit_price=Decimal(str(outcome.target_order.limit_price or 0)),
             qty=outcome.filled_contracts or proposal.contracts,
             status=str(getattr(outcome.target_order.status, "value", outcome.target_order.status)),
         )
+        # Confirm the resting target actually went live rather than stalling in
+        # `pending_new` (§2.6). `_rest_profit_target` submits fire-and-forget and
+        # returns the order as first acknowledged — so a target that never advanced
+        # looked rested while protecting nothing, which is exactly the "resting
+        # target MISSING" the desk showed. The poll persists the real status; a
+        # stall is surfaced loudly so the next reconcile's §2.6 repair picks it up.
+        live = await _await_target_live(ctx, str(outcome.target_order.id))
+        if live != "live":
+            result.warnings.append(
+                f"§2.6 target for {proposal.underlying} {proposal.expiry} did not go "
+                f"live ({live}); the position has no confirmed resting exit. Reconcile "
+                f"will re-rest it next cycle. The 15:40 time stop covers it meanwhile."
+            )
+            log.warning(
+                "structure.target_not_live",
+                underlying=proposal.underlying, expiry=str(proposal.expiry), outcome=live,
+            )
 
     if not outcome.filled:
         result.note(f"no fill after {outcome.rungs_used} rung(s) — {outcome.note}")
